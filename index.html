@@ -42,6 +42,8 @@
   let unsubCustomers = null;
   let unsubProjects  = null;
   let sidebarOpen    = false;
+  let cameraStream   = null;
+  let cardImageData  = null; // 현재 등록 중인 명함 이미지 base64
 
   const col     = s => { let h=0; for(let c of s) h=(h*31+c.charCodeAt(0))%COLORS.length; return COLORS[h]; };
   const ini     = n => n ? n.slice(0,2) : '?';
@@ -105,17 +107,110 @@
   window.showLogin   = () => { $('loginBox').style.display='block';  $('registerBox').style.display='none'; };
   window.showRegister= () => { $('loginBox').style.display='none';   $('registerBox').style.display='block'; };
 
-  // ── Sidebar (mobile) ──────────────────────
+  // ── Sidebar ───────────────────────────────
   window.toggleSidebar = () => {
-    sidebarOpen = !sidebarOpen;
-    $('sidebar').classList.toggle('open', sidebarOpen);
-    $('sidebarOverlay').style.display = sidebarOpen ? 'block' : 'none';
+    sidebarOpen=!sidebarOpen;
+    $('sidebar').classList.toggle('open',sidebarOpen);
+    $('sidebarOverlay').style.display=sidebarOpen?'block':'none';
   };
   window.closeSidebar = () => {
-    sidebarOpen = false;
+    sidebarOpen=false;
     $('sidebar').classList.remove('open');
-    $('sidebarOverlay').style.display = 'none';
+    $('sidebarOverlay').style.display='none';
   };
+
+  // ── Camera ────────────────────────────────
+  window.openCamera = async () => {
+    const wrap = $('cameraWrap');
+    wrap.style.display = 'flex';
+    try {
+      cameraStream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment', width:{ideal:1280}, height:{ideal:720} },
+        audio: false
+      });
+      $('cameraVideo').srcObject = cameraStream;
+      await $('cameraVideo').play();
+    } catch(e) {
+      wrap.style.display = 'none';
+      toast('카메라를 사용할 수 없습니다. 갤러리에서 선택해주세요.');
+    }
+  };
+
+  window.capturePhoto = () => {
+    const video = $('cameraVideo');
+    const canvas = $('cameraCanvas');
+    canvas.width  = video.videoWidth  || 640;
+    canvas.height = video.videoHeight || 480;
+    canvas.getContext('2d').drawImage(video, 0, 0);
+    // 압축: 최대 800px, jpeg 0.75
+    const maxW = 800;
+    const scale = Math.min(1, maxW/canvas.width);
+    const c2 = document.createElement('canvas');
+    c2.width  = Math.round(canvas.width  * scale);
+    c2.height = Math.round(canvas.height * scale);
+    c2.getContext('2d').drawImage(canvas, 0, 0, c2.width, c2.height);
+    cardImageData = c2.toDataURL('image/jpeg', 0.75);
+    closeCamera();
+    updateCardPreview();
+    toast('명함 촬영 완료!');
+  };
+
+  window.closeCamera = () => {
+    if (cameraStream) { cameraStream.getTracks().forEach(t=>t.stop()); cameraStream=null; }
+    $('cameraWrap').style.display = 'none';
+  };
+
+  window.openGallery = () => $('galleryInput').click();
+
+  window.onGallerySelected = input => {
+    const file = input.files[0]; if(!file) return;
+    const reader = new FileReader();
+    reader.onload = e => {
+      // 압축
+      const img = new Image();
+      img.onload = () => {
+        const maxW = 800;
+        const scale = Math.min(1, maxW/img.width);
+        const c = document.createElement('canvas');
+        c.width  = Math.round(img.width  * scale);
+        c.height = Math.round(img.height * scale);
+        c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+        cardImageData = c.toDataURL('image/jpeg', 0.75);
+        updateCardPreview();
+        toast('명함 사진 선택 완료!');
+      };
+      img.src = e.target.result;
+    };
+    reader.readAsDataURL(file);
+    input.value = '';
+  };
+
+  function updateCardPreview() {
+    const preview = $('cardPreview');
+    if (!preview) return;
+    if (cardImageData) {
+      preview.innerHTML = `
+        <div style="position:relative;display:inline-block;width:100%;">
+          <img src="${cardImageData}" style="width:100%;max-height:160px;object-fit:cover;border-radius:10px;display:block;">
+          <button onclick="removeCardImage()" style="position:absolute;top:6px;right:6px;background:rgba(0,0,0,0.55);color:#fff;border:none;border-radius:50%;width:26px;height:26px;font-size:14px;cursor:pointer;display:flex;align-items:center;justify-content:center;">✕</button>
+        </div>`;
+    } else {
+      preview.innerHTML = cardEmptyHtml();
+    }
+  }
+
+  window.removeCardImage = () => { cardImageData=null; updateCardPreview(); };
+
+  function cardEmptyHtml() {
+    return `
+      <div style="border:1.5px dashed rgba(0,0,0,0.15);border-radius:10px;padding:20px;display:flex;flex-direction:column;align-items:center;gap:12px;background:#fafafa;">
+        <div style="font-size:13px;color:#999;">명함 사진 등록 (선택)</div>
+        <div style="display:flex;gap:10px;">
+          <button type="button" class="btn" style="font-size:13px;padding:8px 14px;" onclick="openCamera()">📷 카메라 촬영</button>
+          <button type="button" class="btn" style="font-size:13px;padding:8px 14px;" onclick="openGallery()">🖼 갤러리 선택</button>
+        </div>
+      </div>`;
+  }
 
   // ── App ───────────────────────────────────
   function startApp() {
@@ -177,7 +272,12 @@
     if (customers.some(c=>c.projectId===pid)) { toast('고객이 있는 전시회는 삭제할 수 없습니다.'); return; }
     if (!confirm('전시회를 삭제하시겠습니까?')) return;
     await deleteDoc(doc(db,'projects',pid));
-    if (activeProject===pid) { activeProject=null; customers=[]; $('topbarTitle').textContent='전시회를 선택하세요'; $('topbarMeta').textContent=''; renderStats(); renderTable(); }
+    if (activeProject===pid) {
+      activeProject=null; customers=[];
+      $('topbarTitle').textContent='전시회를 선택하세요';
+      $('topbarMeta').textContent='';
+      renderStats(); renderTable();
+    }
     toast('삭제되었습니다.');
   };
 
@@ -191,11 +291,15 @@
     const btn=$('saveNewBtn'); btn.disabled=true; btn.textContent='저장 중...';
     try {
       await addDoc(collection(db,'customers'),{
-        name, org, region:$('fc_region').value, date:$('fc_date').value||today(),
-        memos:memo?[{text:memo,date:today(),time:new Date().toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'}),author:currentUser.displayName||currentUser.email}]:[],
-        projectId:selPid, createdBy:currentUser.uid,
+        name, org,
+        region:    $('fc_region').value,
+        date:      $('fc_date').value||today(),
+        cardImage: cardImageData||null,
+        memos:     memo?[{text:memo,date:today(),time:new Date().toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'}),author:currentUser.displayName||currentUser.email}]:[],
+        projectId: selPid,
+        createdBy: currentUser.uid,
         authorName:currentUser.displayName||currentUser.email,
-        createdAt:serverTimestamp()
+        createdAt: serverTimestamp()
       });
       if (selPid!==activeProject) selectProject(selPid);
       closeModal(); toast(`${name} 고객이 등록되었습니다.`);
@@ -209,7 +313,9 @@
     if (!org)  { toast('소속을 입력하세요.'); return; }
     const btn=$('saveEditBtn'); btn.disabled=true; btn.textContent='저장 중...';
     try {
-      await updateDoc(doc(db,'customers',cid),{name,org,region:$('ec_region').value,date:$('ec_date').value});
+      const updates = {name, org, region:$('ec_region').value, date:$('ec_date').value};
+      if (cardImageData !== undefined) updates.cardImage = cardImageData;
+      await updateDoc(doc(db,'customers',cid), updates);
       closeModal(); toast('저장되었습니다.');
     } catch(e) { toast('저장 실패: '+e.message); }
     finally { if($('saveEditBtn')){ btn.disabled=false; btn.textContent='저장'; } }
@@ -241,12 +347,13 @@
 
   function renderStats() {
     const wM=customers.filter(c=>c.memos&&c.memos.length).length;
+    const wC=customers.filter(c=>c.cardImage).length;
     const rg=new Set(customers.map(c=>c.region).filter(Boolean)).size;
     const authors=new Set(customers.map(c=>c.authorName||c.createdBy)).size;
     $('statsRow').innerHTML=`
       <div class="stat-card"><div class="stat-label">총 고객</div><div class="stat-value">${customers.length}</div><div class="stat-sub">${isAdmin()?`담당자 ${authors}명`:'내 고객'}</div></div>
       <div class="stat-card"><div class="stat-label">메모 등록</div><div class="stat-value">${wM}</div><div class="stat-sub">${customers.length?Math.round(wM/customers.length*100):0}%</div></div>
-      <div class="stat-card"><div class="stat-label">미메모</div><div class="stat-value">${customers.length-wM}</div><div class="stat-sub">후속 필요</div></div>
+      <div class="stat-card"><div class="stat-label">명함 등록</div><div class="stat-value">${wC}</div><div class="stat-sub">미등록 ${customers.length-wC}명</div></div>
       <div class="stat-card"><div class="stat-label">지역</div><div class="stat-value">${rg}</div><div class="stat-sub">개 지역</div></div>`;
   }
 
@@ -258,14 +365,16 @@
       $('customerTable').innerHTML=`<div class="empty-state">${activeProject?'등록된 고객이 없습니다.':'전시회를 선택해주세요.'}</div>`;
       return;
     }
-    // 모바일: 카드형, 데스크탑: 테이블형
     if (isMobile()) {
-      $('customerTable').innerHTML=cs.map((c,i)=>{
+      $('customerTable').innerHTML=cs.map(c=>{
         const cl=col(c.name);
         const isMe=c.createdBy===currentUser?.uid;
+        const avatarHtml=c.cardImage
+          ?`<img src="${c.cardImage}" style="width:36px;height:36px;border-radius:50%;object-fit:cover;flex-shrink:0;">`
+          :`<div class="cust-avatar" style="width:36px;height:36px;font-size:12px;background:${cl.bg};color:${cl.txt};">${ini(c.name)}</div>`;
         return `<div class="cust-card${selectedCust===c.id?' selected':''}" onclick="selectCustomer('${c.id}')">
           <div style="display:flex;align-items:center;gap:10px;">
-            <div class="cust-avatar" style="width:36px;height:36px;font-size:12px;background:${cl.bg};color:${cl.txt};">${ini(c.name)}</div>
+            ${avatarHtml}
             <div style="flex:1;min-width:0;">
               <div style="font-weight:600;font-size:14px;">${c.name}</div>
               <div style="font-size:12px;color:#555;margin-top:1px;">${c.org}</div>
@@ -279,6 +388,7 @@
             <span>상담일 ${c.date||'—'}</span>
             <span>등록 ${fmtDT(c.createdAt)}</span>
             <span>${isMe?'<span style="color:#1D9E75;font-weight:600;">나</span>':c.authorName||'팀원'}</span>
+            ${c.cardImage?'<span style="color:#1D9E75;">📇 명함</span>':''}
           </div>
         </div>`;
       }).join('');
@@ -286,29 +396,29 @@
       const rows=cs.map((c,i)=>{
         const cl=col(c.name);
         const isMe=c.createdBy===currentUser?.uid;
+        const avatarHtml=c.cardImage
+          ?`<img src="${c.cardImage}" style="width:26px;height:26px;border-radius:50%;object-fit:cover;flex-shrink:0;">`
+          :`<div class="cust-avatar" style="background:${cl.bg};color:${cl.txt};">${ini(c.name)}</div>`;
         return `<div class="table-row${selectedCust===c.id?' selected':''}" onclick="selectCustomer('${c.id}')">
           <div style="font-size:11px;color:#999;text-align:center;">${i+1}</div>
-          <div class="cust-name-cell">
-            <div class="cust-avatar" style="background:${cl.bg};color:${cl.txt};">${ini(c.name)}</div>
-            <span class="cust-name">${c.name}</span>
-          </div>
+          <div class="cust-name-cell">${avatarHtml}<span class="cust-name">${c.name}</span></div>
           <div class="cust-org">${c.org}</div>
           <div><span class="region-badge">${c.region||''}</span></div>
           <div class="date-text">${c.date||'—'}</div>
           <div class="date-text" style="font-size:11px;">${fmtDT(c.createdAt)}</div>
           <div class="date-text" style="font-size:11px;">${isMe?'<span style="color:#1D9E75;font-weight:600;">나</span>':c.authorName||'팀원'}</div>
-          <div><span class="memo-count">메모 ${(c.memos||[]).length}</span></div>
+          <div>${c.cardImage?'<span style="color:#1D9E75;font-size:11px;">📇 등록</span>':'<span class="memo-count">메모 '+((c.memos||[]).length)+'</span>'}</div>
         </div>`;
       }).join('');
       $('customerTable').innerHTML=`
-        <div class="table-head"><div></div><div>이름</div><div>소속</div><div>지역</div><div>상담일</div><div>등록시각</div><div>담당자</div><div>메모</div></div>
+        <div class="table-head"><div></div><div>이름</div><div>소속</div><div>지역</div><div>상담일</div><div>등록시각</div><div>담당자</div><div>명함/메모</div></div>
         ${rows}`;
     }
   }
 
   window.selectCustomer = id => {
     selectedCust=id; renderTable(); renderDetail(id);
-    if (isMobile()) $('detailPanel').scrollIntoView({behavior:'smooth'});
+    if (isMobile()) setTimeout(()=>$('detailPanel').scrollIntoView({behavior:'smooth'}),100);
   };
 
   function renderDetail(cid) {
@@ -318,22 +428,28 @@
     const panel=$('detailPanel');
     panel.style.display='flex';
     const isMe=c.createdBy===currentUser?.uid;
+    const avatarHtml=c.cardImage
+      ?`<img src="${c.cardImage}" style="width:48px;height:48px;border-radius:50%;object-fit:cover;margin-bottom:8px;">`
+      :`<div class="detail-avatar-lg" style="background:${cl.bg};color:${cl.txt};">${ini(c.name)}</div>`;
+    const cardSection=c.cardImage
+      ?`<div style="margin-bottom:12px;">
+          <div style="font-size:11px;font-weight:600;color:#999;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;">명함</div>
+          <img src="${c.cardImage}" style="width:100%;border-radius:10px;border:1px solid rgba(0,0,0,0.08);object-fit:cover;max-height:150px;">
+        </div>`
+      :'';
     const memoHtml=(c.memos||[]).length
       ? c.memos.map(m=>`<div class="memo-item"><div style="line-height:1.6;">${m.text}</div><div class="memo-date">${m.date||''}${m.time?' '+m.time:''} · ${m.author||''}</div></div>`).join('')
       : `<div style="font-size:12px;color:#999;padding:4px 0;">아직 메모가 없습니다.</div>`;
     panel.innerHTML=`
       <div class="detail-header">
-        <div>
-          <div class="detail-avatar-lg" style="background:${cl.bg};color:${cl.txt};">${ini(c.name)}</div>
-          <div class="detail-name">${c.name}</div>
-          <div class="detail-org">${c.org}</div>
-        </div>
+        <div>${avatarHtml}<div class="detail-name">${c.name}</div><div class="detail-org">${c.org}</div></div>
         <div style="display:flex;flex-direction:column;align-items:flex-end;gap:6px;">
           <span style="cursor:pointer;font-size:22px;color:#bbb;" onclick="closeDetail()">✕</span>
           ${isMe||isAdmin()?`<button class="btn" style="font-size:11px;padding:4px 10px;" onclick="openEditCustomer('${c.id}')">편집</button>`:''}
         </div>
       </div>
       <div class="detail-body">
+        ${cardSection}
         <div class="detail-meta-row"><span class="detail-meta-label">지역</span><span class="region-badge">${c.region||''}</span></div>
         <div class="detail-meta-row"><span class="detail-meta-label">상담일</span>${c.date||'—'}</div>
         <div class="detail-meta-row"><span class="detail-meta-label">담당자</span>${isMe?'나 ('+(currentUser.displayName||currentUser.email)+')':c.authorName||'팀원'}</div>
@@ -354,10 +470,15 @@
   window.closeDetail = () => { selectedCust=null; $('detailPanel').style.display='none'; renderTable(); };
 
   window.openModal  = html => { $('modal').innerHTML=html; $('modalOverlay').style.display='flex'; };
-  window.closeModal = () => $('modalOverlay').style.display='none';
+  window.closeModal = () => {
+    $('modalOverlay').style.display='none';
+    closeCamera();
+    cardImageData=null;
+  };
 
   window.openAddCustomer = () => {
     if (!projects.length) { toast('먼저 전시회를 등록해주세요.'); return; }
+    cardImageData = null;
     openModal(`
       <div class="modal-title">신규 고객 등록</div>
       <div class="modal-sub">고객 정보를 입력하고 저장하세요.</div>
@@ -372,6 +493,10 @@
           <select id="fc_region">${REGIONS.map(r=>`<option>${r}</option>`).join('')}</select></div>
         <div><label class="form-label">상담일</label><input type="date" id="fc_date" value="${today()}"></div>
       </div>
+      <div class="form-row">
+        <label class="form-label">명함 사진</label>
+        <div id="cardPreview">${cardEmptyHtml()}</div>
+      </div>
       <div class="form-row"><label class="form-label">첫 상담 메모 (선택)</label>
         <textarea id="fc_memo" placeholder="상담 내용을 입력하세요..."></textarea></div>
       <div class="modal-footer">
@@ -382,6 +507,7 @@
 
   window.openEditCustomer = cid => {
     const c=customers.find(x=>x.id===cid); if(!c) return;
+    cardImageData = c.cardImage||null;
     openModal(`
       <div class="modal-title">고객 정보 편집</div>
       <div class="modal-sub">${c.name} · ${c.org}</div>
@@ -392,7 +518,16 @@
       <div class="form-row-2">
         <div><label class="form-label">지역</label>
           <select id="ec_region">${REGIONS.map(r=>`<option${r===c.region?' selected':''}>${r}</option>`).join('')}</select></div>
-        <div><label class="form-label">상담일</label><input type="date" id="ec_date" value="${c.date||''}"></div>
+        <div><label class="form-label">상담일</label><input type="date" id="ec_date" value="${c.date||today()}"></div>
+      </div>
+      <div class="form-row">
+        <label class="form-label">명함 사진</label>
+        <div id="cardPreview">${c.cardImage
+          ? `<div style="position:relative;display:inline-block;width:100%;">
+               <img src="${c.cardImage}" style="width:100%;max-height:160px;object-fit:cover;border-radius:10px;display:block;">
+               <button onclick="removeCardImage()" style="position:absolute;top:6px;right:6px;background:rgba(0,0,0,0.55);color:#fff;border:none;border-radius:50%;width:26px;height:26px;font-size:14px;cursor:pointer;display:flex;align-items:center;justify-content:center;">✕</button>
+             </div>`
+          : cardEmptyHtml()}</div>
       </div>
       <div class="modal-footer">
         <button class="btn btn-danger" onclick="deleteCustomer('${c.id}')">삭제</button>
@@ -450,7 +585,7 @@
       }).join('')||'<div class="empty-state">등록된 전시회가 없습니다.</div>'}`;
   }
 
-  window.addEventListener('resize', () => { renderTable(); });
+  window.addEventListener('resize', renderTable);
   document.addEventListener('keydown', e => {
     if (e.key==='Enter'&&e.target.id==='authEmail') $('authPw').focus();
     if (e.key==='Enter'&&e.target.id==='authPw') doLogin();
@@ -470,7 +605,6 @@
 }
 body{background:var(--bg);color:var(--c-text);min-height:100vh;}
 
-/* Auth */
 #authScreen{min-height:100vh;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#0a3d2b 0%,#1D9E75 100%);padding:16px;}
 .auth-card{background:var(--surface);border-radius:18px;padding:36px 28px;width:100%;max-width:380px;box-shadow:0 24px 64px rgba(0,0,0,0.18);}
 .auth-logo{display:flex;align-items:center;gap:10px;margin-bottom:24px;}
@@ -481,20 +615,11 @@ body{background:var(--bg);color:var(--c-text);min-height:100vh;}
 .auth-switch{font-size:13px;color:var(--c-muted);margin-top:16px;text-align:center;}
 .auth-switch a{color:var(--green);cursor:pointer;text-decoration:underline;}
 
-/* App Layout */
 #appScreen{display:flex;height:100vh;height:100dvh;overflow:hidden;}
-
-/* Sidebar overlay (mobile) */
 #sidebarOverlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:99;}
-
-/* Sidebar */
-.sidebar{
-  width:220px;min-width:220px;background:var(--surface);
-  border-right:1px solid var(--border);display:flex;flex-direction:column;
-  transition:transform 0.25s ease;z-index:100;
-}
+.sidebar{width:220px;min-width:220px;background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;transition:transform 0.25s ease;z-index:100;}
 .sidebar-top{padding:16px 16px 12px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;}
-.logo{font-size:15px;font-weight:600;display:flex;align-items:center;gap:8px;letter-spacing:-0.3px;}
+.logo{font-size:15px;font-weight:600;display:flex;align-items:center;gap:8px;}
 .logo-dot{width:9px;height:9px;border-radius:50%;background:var(--green);}
 .sidebar-close{display:none;cursor:pointer;font-size:20px;color:var(--c-muted);padding:0 4px;}
 .sidebar-section{padding:12px 10px 4px;}
@@ -515,12 +640,10 @@ body{background:var(--bg);color:var(--c-text);min-height:100vh;}
 .logout-btn{font-size:11px;color:var(--c-muted);cursor:pointer;padding:2px 4px;border-radius:4px;display:inline-block;margin-top:2px;}
 .logout-btn:hover{color:var(--danger);background:var(--danger-l);}
 
-/* Main */
 .main{flex:1;display:flex;flex-direction:column;overflow:hidden;min-width:0;}
 .topbar{background:var(--surface);border-bottom:1px solid var(--border);padding:0 16px;height:52px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0;gap:8px;}
 .topbar-left{display:flex;align-items:center;gap:10px;min-width:0;flex:1;}
 .menu-btn{display:none;cursor:pointer;padding:6px;border-radius:var(--radius);background:none;border:none;color:var(--c-text);}
-.menu-btn svg{display:block;}
 .topbar-title{font-size:14px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .topbar-meta{font-size:11px;color:var(--c-muted);}
 .topbar-actions{display:flex;align-items:center;gap:8px;flex-shrink:0;}
@@ -528,7 +651,6 @@ body{background:var(--bg);color:var(--c-text);min-height:100vh;}
 .search-bar input{border:none;background:transparent;outline:none;font-size:13px;color:var(--c-text);font-family:inherit;width:150px;}
 .content{flex:1;overflow-y:auto;padding:16px;}
 
-/* Stats */
 .stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px;}
 .stat-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:12px 14px;}
 .stat-label{font-size:11px;color:var(--c-muted);margin-bottom:3px;}
@@ -537,10 +659,9 @@ body{background:var(--bg);color:var(--c-text);min-height:100vh;}
 .section-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;}
 .section-title{font-size:13px;font-weight:600;color:var(--c-text2);}
 
-/* Table (desktop) */
 .customer-table{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);overflow:hidden;}
-.table-head{display:grid;grid-template-columns:32px 1.4fr 1.4fr 0.8fr 0.9fr 1.2fr 1fr 0.7fr;padding:0 12px;height:34px;align-items:center;background:var(--bg);border-bottom:1px solid var(--border);font-size:10px;font-weight:600;color:var(--c-muted);text-transform:uppercase;letter-spacing:0.5px;gap:6px;}
-.table-row{display:grid;grid-template-columns:32px 1.4fr 1.4fr 0.8fr 0.9fr 1.2fr 1fr 0.7fr;padding:0 12px;min-height:44px;align-items:center;border-bottom:1px solid var(--border);cursor:pointer;transition:background 0.12s;font-size:13px;gap:6px;}
+.table-head{display:grid;grid-template-columns:32px 1.4fr 1.4fr 0.8fr 0.9fr 1.2fr 1fr 0.8fr;padding:0 12px;height:34px;align-items:center;background:var(--bg);border-bottom:1px solid var(--border);font-size:10px;font-weight:600;color:var(--c-muted);text-transform:uppercase;letter-spacing:0.5px;gap:6px;}
+.table-row{display:grid;grid-template-columns:32px 1.4fr 1.4fr 0.8fr 0.9fr 1.2fr 1fr 0.8fr;padding:0 12px;min-height:44px;align-items:center;border-bottom:1px solid var(--border);cursor:pointer;transition:background 0.12s;font-size:13px;gap:6px;}
 .table-row:last-child{border-bottom:none;}
 .table-row:hover{background:var(--bg);}
 .table-row.selected{background:var(--green-l);}
@@ -552,14 +673,11 @@ body{background:var(--bg);color:var(--c-text);min-height:100vh;}
 .date-text{font-size:12px;color:var(--c-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .memo-count{font-size:11px;padding:2px 7px;border-radius:8px;background:var(--bg);color:var(--c-muted);white-space:nowrap;}
 
-/* Card (mobile) */
 .cust-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:14px;margin-bottom:8px;cursor:pointer;transition:background 0.12s;}
 .cust-card:hover{background:var(--bg);}
 .cust-card.selected{background:var(--green-l);border-color:var(--green-m);}
-
 .empty-state{text-align:center;padding:40px 20px;color:var(--c-muted);font-size:13px;}
 
-/* Buttons */
 .btn{padding:8px 14px;border-radius:var(--radius);font-size:13px;cursor:pointer;border:1px solid var(--border2);background:var(--surface);color:var(--c-text);display:inline-flex;align-items:center;gap:6px;transition:background 0.15s;font-family:inherit;font-weight:500;white-space:nowrap;}
 .btn:hover{background:var(--bg);}
 .btn-primary{background:var(--green);color:#fff;border-color:var(--green);}
@@ -568,23 +686,28 @@ body{background:var(--bg);color:var(--c-text);min-height:100vh;}
 .btn-danger:hover{background:var(--danger-l);}
 .btn:disabled{opacity:0.6;cursor:not-allowed;}
 
-/* Forms */
 .form-row{margin-bottom:14px;}
 .form-row-2{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px;}
 .form-label{font-size:12px;font-weight:600;color:var(--c-text2);margin-bottom:5px;display:block;}
 .req{color:var(--danger);}
 input[type=text],input[type=date],select,textarea{width:100%;font-size:14px;border:1px solid var(--border2);border-radius:var(--radius);background:var(--surface);color:var(--c-text);padding:10px 12px;font-family:inherit;}
 input[type=text]:focus,input[type=date]:focus,select:focus,textarea:focus{outline:none;border-color:var(--green);box-shadow:0 0 0 3px rgba(29,158,117,0.12);}
-textarea{resize:vertical;min-height:90px;line-height:1.5;}
+textarea{resize:vertical;min-height:80px;line-height:1.5;}
 
-/* Modal */
-.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.45);display:flex;align-items:flex-end;justify-content:center;z-index:200;padding:0;}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.45);display:flex;align-items:flex-end;justify-content:center;z-index:200;}
 .modal{background:var(--surface);border-radius:18px 18px 0 0;width:100%;max-width:540px;max-height:92vh;overflow-y:auto;padding:24px 20px 32px;}
 .modal-title{font-size:17px;font-weight:600;margin-bottom:4px;}
 .modal-sub{font-size:12px;color:var(--c-muted);margin-bottom:20px;}
 .modal-footer{display:flex;justify-content:flex-end;gap:8px;margin-top:20px;border-top:1px solid var(--border);padding-top:16px;}
 
-/* Detail panel */
+/* Camera */
+#cameraWrap{position:fixed;inset:0;background:rgba(0,0,0,0.92);display:none;flex-direction:column;align-items:center;justify-content:center;z-index:300;gap:16px;padding:20px;}
+#cameraVideo{width:100%;max-width:480px;border-radius:14px;border:2px solid var(--green);background:#000;}
+.camera-actions{display:flex;gap:12px;}
+.cam-btn{padding:12px 24px;border-radius:var(--radius);font-size:14px;cursor:pointer;border:none;font-family:inherit;font-weight:600;}
+.cam-shoot{background:var(--green);color:#fff;}
+.cam-cancel{background:rgba(255,255,255,0.15);color:#fff;}
+
 #detailPanel{width:100%;background:var(--surface);border-top:1px solid var(--border);display:flex;flex-direction:column;overflow-y:auto;flex-shrink:0;max-height:55vh;}
 .detail-header{padding:16px 16px 12px;border-bottom:1px solid var(--border);display:flex;align-items:flex-start;justify-content:space-between;}
 .detail-avatar-lg{width:44px;height:44px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:600;margin-bottom:8px;}
@@ -600,11 +723,9 @@ textarea{resize:vertical;min-height:90px;line-height:1.5;}
 .project-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:14px 16px;margin-bottom:10px;display:flex;align-items:center;justify-content:space-between;transition:background 0.15s;}
 .project-card:hover{background:var(--bg);}
 
-/* Toast */
 #toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#1a1a1a;color:#fff;padding:10px 20px;border-radius:var(--radius);font-size:13px;z-index:999;opacity:0;transition:opacity 0.25s;pointer-events:none;white-space:nowrap;}
 #toast.show{opacity:1;}
 
-/* ── 태블릿/데스크탑 (769px+) ── */
 @media(min-width:769px){
   .menu-btn{display:none!important;}
   .sidebar-close{display:none!important;}
@@ -616,13 +737,11 @@ textarea{resize:vertical;min-height:90px;line-height:1.5;}
   .content{padding:20px 24px;}
   .topbar{padding:0 24px;height:54px;}
   .topbar-title{font-size:15px;}
-  .topbar-meta{display:block;}
   .search-bar input{width:180px;}
   .stats-row{gap:12px;margin-bottom:20px;}
   .stat-value{font-size:24px;}
 }
 
-/* ── 모바일 (768px 이하) ── */
 @media(max-width:768px){
   .sidebar{position:fixed;top:0;left:0;height:100%;transform:translateX(-100%);box-shadow:4px 0 20px rgba(0,0,0,0.15);}
   .sidebar.open{transform:translateX(0);}
@@ -665,9 +784,7 @@ textarea{resize:vertical;min-height:90px;line-height:1.5;}
 </div>
 
 <div id="appScreen" style="display:none;">
-
   <div id="sidebarOverlay" onclick="closeSidebar()"></div>
-
   <div class="sidebar" id="sidebar">
     <div class="sidebar-top">
       <div class="logo"><div class="logo-dot"></div>ExhibitCRM</div>
@@ -717,16 +834,11 @@ textarea{resize:vertical;min-height:90px;line-height:1.5;}
         <button class="btn btn-primary" style="padding:8px 12px;font-size:13px;" onclick="openAddCustomer()">+ 고객</button>
       </div>
     </div>
-
     <div class="content">
       <div id="viewCustomers">
         <div class="stats-row" id="statsRow"></div>
         <div class="section-header">
           <div class="section-title" id="sectionTitle">고객 목록</div>
-          <button class="btn" style="font-size:12px;padding:5px 10px;display:none;" id="searchToggle" onclick="toggleMobileSearch()">🔍</button>
-        </div>
-        <div id="mobileSearchBar" style="display:none;margin-bottom:10px;">
-          <input type="text" id="mobileSearch" placeholder="이름, 소속 검색..." oninput="document.getElementById('searchInput').value=this.value;renderTable();" style="width:100%;padding:10px 12px;border:1px solid rgba(0,0,0,0.13);border-radius:10px;font-size:14px;background:#fff;">
         </div>
         <div class="customer-table" id="customerTable">
           <div class="empty-state">전시회를 선택하면 고객 목록이 표시됩니다.</div>
@@ -735,31 +847,26 @@ textarea{resize:vertical;min-height:90px;line-height:1.5;}
       <div id="viewProjects" style="display:none;"></div>
     </div>
   </div>
-
   <div id="detailPanel" style="display:none;"></div>
 </div>
+
+<!-- Camera -->
+<div id="cameraWrap">
+  <video id="cameraVideo" autoplay playsinline muted></video>
+  <canvas id="cameraCanvas" style="display:none;"></canvas>
+  <div style="font-size:13px;color:rgba(255,255,255,0.6);">명함에 카메라를 맞추세요</div>
+  <div class="camera-actions">
+    <button class="cam-btn cam-shoot" onclick="capturePhoto()">📸 촬영</button>
+    <button class="cam-btn cam-cancel" onclick="closeCamera()">취소</button>
+  </div>
+</div>
+
+<!-- Gallery input -->
+<input type="file" id="galleryInput" accept="image/*" style="display:none;" onchange="onGallerySelected(this)">
 
 <div class="modal-overlay" id="modalOverlay" style="display:none;" onclick="if(event.target===this)closeModal()">
   <div class="modal" id="modal"></div>
 </div>
 <div id="toast"></div>
-
-<script>
-// 모바일 검색바 토글
-function toggleMobileSearch(){
-  const bar=document.getElementById('mobileSearchBar');
-  const isHidden=bar.style.display==='none';
-  bar.style.display=isHidden?'block':'none';
-  if(isHidden) document.getElementById('mobileSearch').focus();
-}
-// 모바일에서 검색 버튼 표시
-function updateMobileUI(){
-  const btn=document.getElementById('searchToggle');
-  if(window.innerWidth<=768) btn.style.display='flex';
-  else btn.style.display='none';
-}
-window.addEventListener('resize',updateMobileUI);
-updateMobileUI();
-</script>
 </body>
 </html>
