@@ -1,0 +1,661 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ExhibitCRM — 전시회 고객 관리</title>
+<link href="https://fonts.googleapis.com/css2?family=Pretendard:wght@400;500;600&display=swap" rel="stylesheet">
+
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile }
+    from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+  import { getFirestore, collection, doc, addDoc, updateDoc, deleteDoc, onSnapshot, query, where, serverTimestamp, orderBy }
+    from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+  // ✅ Firebase 설정값
+  const firebaseConfig = {
+    apiKey: "AIzaSyANPn-V_KmdLtyBJ25eiwLw8zKh4Y_7h1w",
+    authDomain: "exhibition-test-e04bd.firebaseapp.com",
+    projectId: "exhibition-test-e04bd",
+    storageBucket: "exhibition-test-e04bd.firebasestorage.app",
+    messagingSenderId: "633920247304",
+    appId: "1:633920247304:web:58c1b98816ebf76318a3bd"
+  };
+
+  const app = initializeApp(firebaseConfig);
+  const auth = getAuth(app);
+  const db   = getFirestore(app);
+
+  const REGIONS = ['서울','부산','인천','대구','대전','광주','울산','세종','경기','강원','충북','충남','전북','전남','경북','경남','제주'];
+  const COLORS  = [
+    {bg:'#E1F5EE',txt:'#0F6E56'},{bg:'#E6F1FB',txt:'#185FA5'},
+    {bg:'#FAEEDA',txt:'#854F0B'},{bg:'#FBEAF0',txt:'#993556'},
+    {bg:'#EEEDFE',txt:'#3C3489'},{bg:'#EAF3DE',txt:'#3B6D11'},
+  ];
+
+  const ADMIN_EMAIL = 'gskim@jeiotech.com';
+
+  let currentUser   = null;
+  let activeProject = null;
+  let projects      = [];
+  let customers     = [];
+  let selectedCust  = null;
+  let unsubscribers = [];
+
+  const col      = s => { let h=0; for(let c of s) h=(h*31+c.charCodeAt(0))%COLORS.length; return COLORS[h]; };
+  const ini      = n => n ? n.slice(0,2) : '?';
+  const today    = () => new Date().toISOString().split('T')[0];
+  const $        = id => document.getElementById(id);
+  const toast    = msg => { const t=$('toast'); t.textContent=msg; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),2600); };
+  const isAdmin  = () => currentUser?.email === ADMIN_EMAIL;
+  const fmtDT    = ts => {
+    if (!ts) return '—';
+    const d = ts.toDate ? ts.toDate() : new Date(ts);
+    return d.toLocaleDateString('ko-KR') + ' ' + d.toLocaleTimeString('ko-KR', {hour:'2-digit', minute:'2-digit'});
+  };
+
+  // ── Auth ──────────────────────────────────
+  onAuthStateChanged(auth, user => {
+    currentUser = user;
+    if (user) {
+      $('authScreen').style.display = 'none';
+      $('appScreen').style.display  = 'flex';
+      $('userDisplayName').textContent = user.displayName || user.email;
+      $('userAvatar').textContent = ini(user.displayName || user.email);
+      $('adminBadge').style.display = user.email === ADMIN_EMAIL ? 'inline-block' : 'none';
+      subscribeProjects();
+    } else {
+      $('authScreen').style.display = 'flex';
+      $('appScreen').style.display  = 'none';
+      unsubscribers.forEach(u => u());
+      unsubscribers = [];
+      projects = []; customers = []; activeProject = null; selectedCust = null;
+    }
+  });
+
+  window.doLogin = async () => {
+    const email = $('authEmail').value.trim();
+    const pw    = $('authPw').value.trim();
+    if (!email||!pw) { toast('이메일과 비밀번호를 입력하세요.'); return; }
+    try {
+      await signInWithEmailAndPassword(auth, email, pw);
+    } catch(e) {
+      toast('로그인 실패: ' + (e.code==='auth/invalid-credential' ? '이메일 또는 비밀번호가 틀렸습니다.' : e.message));
+    }
+  };
+
+  window.doRegister = async () => {
+    const name  = $('regName').value.trim();
+    const email = $('regEmail').value.trim();
+    const pw    = $('regPw').value.trim();
+    if (!name||!email||!pw) { toast('모든 항목을 입력하세요.'); return; }
+    if (pw.length < 6) { toast('비밀번호는 6자 이상이어야 합니다.'); return; }
+    try {
+      const cred = await createUserWithEmailAndPassword(auth, email, pw);
+      await updateProfile(cred.user, { displayName: name });
+      toast(`${name}님, 환영합니다!`);
+    } catch(e) {
+      toast('가입 실패: ' + (e.code==='auth/email-already-in-use' ? '이미 사용 중인 이메일입니다.' : e.message));
+    }
+  };
+
+  window.doLogout    = () => signOut(auth);
+  window.showLogin   = () => { $('loginBox').style.display='block'; $('registerBox').style.display='none'; };
+  window.showRegister= () => { $('loginBox').style.display='none';  $('registerBox').style.display='block'; };
+
+  // ── Projects ──────────────────────────────
+  function subscribeProjects() {
+    const q = query(collection(db,'projects'), orderBy('createdAt','desc'));
+    const unsub = onSnapshot(q, snap => {
+      projects = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      renderProjectList();
+      if (!activeProject && projects.length) selectProject(projects[0].id);
+    });
+    unsubscribers.push(unsub);
+  }
+
+  window.selectProject = pid => {
+    activeProject = pid; selectedCust = null;
+    $('detailPanel').style.display = 'none';
+    unsubscribers.slice(1).forEach(u => u());
+    unsubscribers = [unsubscribers[0]];
+    subscribeCustomers(pid);
+    renderProjectList();
+    const p = projects.find(x=>x.id===pid);
+    if (p) { $('topbarTitle').textContent=p.name; $('topbarMeta').textContent=`고객 관리 · ${p.location||''}`; }
+    setView('customers');
+  };
+
+  window.saveProject = async () => {
+    const name = $('fp_name').value.trim();
+    if (!name) { toast('전시회명을 입력하세요.'); return; }
+    const dateFrom = $('fp_date_from').value;
+    const dateTo   = $('fp_date_to').value;
+    if (dateFrom && dateTo && dateTo < dateFrom) { toast('종료일은 시작일보다 이후여야 합니다.'); return; }
+    await addDoc(collection(db,'projects'), {
+      name, location: $('fp_loc').value.trim()||'',
+      dateFrom: dateFrom||'', dateTo: dateTo||'',
+      createdBy: currentUser.uid, createdAt: serverTimestamp()
+    });
+    closeModal(); toast(`"${name}" 전시회가 등록되었습니다.`);
+  };
+
+  window.deleteProject = async pid => {
+    if (customers.some(c=>c.projectId===pid)) { toast('고객이 있는 전시회는 삭제할 수 없습니다.'); return; }
+    if (!confirm('전시회를 삭제하시겠습니까?')) return;
+    await deleteDoc(doc(db,'projects',pid));
+    if (activeProject===pid) { activeProject=null; $('topbarTitle').textContent='전시회를 선택하세요'; $('topbarMeta').textContent=''; }
+    toast('삭제되었습니다.');
+  };
+
+  // ── Customers ─────────────────────────────
+  function subscribeCustomers(pid) {
+    const q = isAdmin()
+      ? query(collection(db,'customers'), where('projectId','==',pid), orderBy('createdAt','desc'))
+      : query(collection(db,'customers'), where('projectId','==',pid), where('createdBy','==',currentUser.uid), orderBy('createdAt','desc'));
+    const unsub = onSnapshot(q, snap => {
+      customers = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      renderStats(); renderTable();
+      if (selectedCust) renderDetail(selectedCust);
+    });
+    unsubscribers.push(unsub);
+  }
+
+  window.saveNewCustomer = async () => {
+    const name = $('fc_name').value.trim();
+    const org  = $('fc_org').value.trim();
+    if (!name) { toast('고객명을 입력하세요.'); return; }
+    if (!org)  { toast('소속을 입력하세요.'); return; }
+    const selectedPid = $('fc_project').value;
+    if (!selectedPid) { toast('전시회를 선택하세요.'); return; }
+    const memo = $('fc_memo').value.trim();
+    const btn  = $('saveNewBtn');
+    btn.disabled=true; btn.textContent='저장 중...';
+    try {
+      await addDoc(collection(db,'customers'), {
+        name, org,
+        region: $('fc_region').value,
+        date:   $('fc_date').value||today(),
+        memos:  memo ? [{ text:memo, date:today(), author: currentUser.displayName||currentUser.email }] : [],
+        projectId: selectedPid,
+        createdBy: currentUser.uid,
+        authorName: currentUser.displayName || currentUser.email,
+        createdAt: serverTimestamp()
+      });
+      if (selectedPid !== activeProject) {
+        selectProject(selectedPid);
+      }
+      closeModal(); toast(`${name} 고객이 등록되었습니다.`);
+    } catch(e) { toast('저장 실패: '+e.message); }
+    finally { if($('saveNewBtn')){ btn.disabled=false; btn.textContent='저장'; } }
+  };
+
+  window.saveEditCustomer = async cid => {
+    const name = $('ec_name').value.trim();
+    const org  = $('ec_org').value.trim();
+    if (!name) { toast('고객명을 입력하세요.'); return; }
+    if (!org)  { toast('소속을 입력하세요.'); return; }
+    const btn = $('saveEditBtn');
+    btn.disabled=true; btn.textContent='저장 중...';
+    try {
+      await updateDoc(doc(db,'customers',cid), {
+        name, org,
+        region: $('ec_region').value,
+        date:   $('ec_date').value
+      });
+      closeModal(); toast('저장되었습니다.');
+    } catch(e) { toast('저장 실패: '+e.message); }
+    finally { if($('saveEditBtn')){ btn.disabled=false; btn.textContent='저장'; } }
+  };
+
+  window.deleteCustomer = async cid => {
+    if (!confirm('정말 삭제하시겠습니까?')) return;
+    await deleteDoc(doc(db,'customers',cid));
+    selectedCust=null; closeModal(); $('detailPanel').style.display='none';
+    toast('삭제되었습니다.');
+  };
+
+  window.addMemo = async cid => {
+    const txt = $('newMemoText').value.trim();
+    if (!txt) { toast('내용을 입력하세요.'); return; }
+    const c = customers.find(x=>x.id===cid);
+    const memos = [{ text:txt, date:today(), author: currentUser.displayName||currentUser.email }, ...(c.memos||[])];
+    await updateDoc(doc(db,'customers',cid), { memos });
+    toast('메모가 저장되었습니다.');
+  };
+
+  // ── Render: Project List ───────────────────
+  function renderProjectList() {
+    $('projectList').innerHTML = projects.map(p => {
+      const cnt = customers.filter(c=>c.projectId===p.id).length;
+      return `<div class="project-chip${p.id===activeProject?' active':''}" onclick="selectProject('${p.id}')">
+        <span class="project-chip-name">${p.name}</span>
+        <span class="project-count">${cnt}</span>
+      </div>`;
+    }).join('') || '<div style="font-size:12px;color:#999;padding:6px 8px;">전시회가 없습니다.</div>';
+  }
+
+  // ── Render: Stats ──────────────────────────
+  function renderStats() {
+    const wM = customers.filter(c=>c.memos&&c.memos.length).length;
+    const rg = new Set(customers.map(c=>c.region)).size;
+    const today_custs = customers.filter(c=>c.date===today()).length;
+    $('statsRow').innerHTML = `
+      <div class="stat-card"><div class="stat-label">총 고객 수</div><div class="stat-value">${customers.length}</div><div class="stat-sub">오늘 ${today_custs}명 등록</div></div>
+      <div class="stat-card"><div class="stat-label">메모 등록</div><div class="stat-value">${wM}</div><div class="stat-sub">전체의 ${customers.length?Math.round(wM/customers.length*100):0}%</div></div>
+      <div class="stat-card"><div class="stat-label">미메모</div><div class="stat-value">${customers.length-wM}</div><div class="stat-sub">후속 상담 필요</div></div>
+      <div class="stat-card"><div class="stat-label">지역 분포</div><div class="stat-value">${rg}</div><div class="stat-sub">개 지역</div></div>`;
+  }
+
+  // ── Render: Table ──────────────────────────
+  function renderTable() {
+    const q = ($('searchInput')||{value:''}).value.toLowerCase();
+    let cs = customers.filter(c => !q || c.name.toLowerCase().includes(q)||c.org.toLowerCase().includes(q)||(c.region||'').includes(q));
+    $('sectionTitle').textContent = `전체 고객 ${cs.length}명`;
+    if (!cs.length) {
+      $('customerTable').innerHTML = `<div class="empty-state">등록된 고객이 없습니다.<br><span style="font-size:11px;margin-top:6px;display:block;">상단 '+ 고객 추가' 버튼으로 등록하세요.</span></div>`;
+      return;
+    }
+    const rows = cs.map((c,i) => {
+      const cl = col(c.name);
+      return `<div class="table-row${selectedCust===c.id?' selected':''}" onclick="selectCustomer('${c.id}')">
+        <div style="font-size:11px;color:#999;text-align:center;">${i+1}</div>
+        <div class="cust-name-cell">
+          <div class="cust-avatar" style="background:${cl.bg};color:${cl.txt};">${ini(c.name)}</div>
+          <span class="cust-name">${c.name}</span>
+        </div>
+        <div class="cust-org">${c.org}</div>
+        <div><span class="region-badge">${c.region||''}</span></div>
+        <div class="date-text">${c.date||'—'}</div>
+        <div class="date-text" style="font-size:11px;">${fmtDT(c.createdAt)}</div>
+        <div class="date-text">${c.createdBy===currentUser?.uid?'<span style="color:#1D9E75;font-size:11px;">나</span>':c.authorName||'팀원'}</div>
+        <div><span class="memo-count">메모 ${(c.memos||[]).length}</span></div>
+      </div>`;
+    }).join('');
+    $('customerTable').innerHTML = `
+      <div class="table-head"><div></div><div>이름</div><div>소속</div><div>지역</div><div>상담일</div><div>등록시각</div><div>담당</div><div>메모</div></div>
+      ${rows}`;
+  }
+
+  window.selectCustomer = id => { selectedCust=id; renderTable(); renderDetail(id); };
+
+  function renderDetail(cid) {
+    const c = customers.find(x=>x.id===cid);
+    if (!c) { $('detailPanel').style.display='none'; return; }
+    const cl = col(c.name);
+    const panel = $('detailPanel');
+    panel.style.display = 'flex';
+    const memoHtml = (c.memos||[]).length
+      ? c.memos.map(m=>`<div class="memo-item">
+          <div style="line-height:1.6;">${m.text}</div>
+          <div class="memo-date">${m.date||''} · ${m.author||''}</div>
+        </div>`).join('')
+      : `<div style="font-size:12px;color:#999;padding:4px 0;">아직 메모가 없습니다.</div>`;
+    panel.innerHTML = `
+      <div class="detail-header">
+        <div>
+          <div class="detail-avatar-lg" style="background:${cl.bg};color:${cl.txt};">${ini(c.name)}</div>
+          <div class="detail-name">${c.name}</div>
+          <div class="detail-org">${c.org}</div>
+        </div>
+        <div style="display:flex;flex-direction:column;align-items:flex-end;gap:6px;">
+          <span style="cursor:pointer;font-size:20px;color:#bbb;line-height:1;" onclick="closeDetail()">✕</span>
+          <button class="btn" style="font-size:11px;padding:4px 10px;" onclick="openEditCustomer('${c.id}')">편집</button>
+        </div>
+      </div>
+      <div class="detail-body">
+        <div class="detail-meta-row"><span class="detail-meta-label">지역</span><span class="region-badge">${c.region||''}</span></div>
+        <div class="detail-meta-row"><span class="detail-meta-label">상담일</span>${c.date||'—'}</div>
+        <div class="detail-meta-row"><span class="detail-meta-label">담당자</span>${c.createdBy===currentUser?.uid?'나 ('+currentUser.displayName+')':c.authorName||'팀원'}</div>
+      <div class="detail-meta-row"><span class="detail-meta-label">등록시각</span>${fmtDT(c.createdAt)}</div>
+      </div>
+      <div class="memo-section">
+        <div class="memo-section-title">상담 메모 (${(c.memos||[]).length})</div>
+        <div id="memoList">${memoHtml}</div>
+        <div style="margin-top:12px;">
+          <textarea id="newMemoText" placeholder="상담 내용을 입력하세요..."></textarea>
+          <div style="display:flex;justify-content:flex-end;margin-top:6px;">
+            <button class="btn btn-primary" style="font-size:12px;padding:6px 14px;" onclick="addMemo('${c.id}')">메모 저장</button>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  window.closeDetail = () => { selectedCust=null; $('detailPanel').style.display='none'; renderTable(); };
+
+  // ── Modal ─────────────────────────────────
+  window.openModal  = html => { $('modal').innerHTML=html; $('modalOverlay').style.display='flex'; };
+  window.closeModal = () => $('modalOverlay').style.display='none';
+
+  window.openAddCustomer = () => {
+    if (!projects.length) { toast('먼저 전시회를 등록해주세요.'); return; }
+    openModal(`
+      <div class="modal-title">신규 고객 등록</div>
+      <div class="modal-sub">고객 정보를 입력하고 저장하세요.</div>
+      <div class="form-row">
+        <label class="form-label">전시회 선택 <span class="req">*</span></label>
+        <select id="fc_project">
+          ${projects.map(p=>`<option value="${p.id}"${p.id===activeProject?' selected':''}>${p.name}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-row-2">
+        <div><label class="form-label">고객명 <span class="req">*</span></label><input type="text" id="fc_name" placeholder="홍길동" autocomplete="off"></div>
+        <div><label class="form-label">소속 <span class="req">*</span></label><input type="text" id="fc_org" placeholder="회사명" autocomplete="off"></div>
+      </div>
+      <div class="form-row-2">
+        <div><label class="form-label">지역</label>
+          <select id="fc_region">${REGIONS.map(r=>`<option>${r}</option>`).join('')}</select></div>
+        <div><label class="form-label">상담일</label>
+          <input type="text" id="fc_date" value="${today()}" autocomplete="off"></div>
+      </div>
+      <div class="form-row">
+        <label class="form-label">첫 상담 메모 (선택)</label>
+        <textarea id="fc_memo" placeholder="상담 내용을 입력하세요..."></textarea>
+      </div>
+      <div class="modal-footer">
+        <button class="btn" onclick="closeModal()">취소</button>
+        <button class="btn btn-primary" id="saveNewBtn" onclick="saveNewCustomer()">저장</button>
+      </div>`);
+  };
+
+  window.openEditCustomer = cid => {
+    const c = customers.find(x=>x.id===cid); if(!c) return;
+    openModal(`
+      <div class="modal-title">고객 정보 편집</div>
+      <div class="modal-sub">${c.name} · ${c.org}</div>
+      <div class="form-row-2">
+        <div><label class="form-label">고객명 <span class="req">*</span></label><input type="text" id="ec_name" value="${c.name}" autocomplete="off"></div>
+        <div><label class="form-label">소속 <span class="req">*</span></label><input type="text" id="ec_org" value="${c.org}" autocomplete="off"></div>
+      </div>
+      <div class="form-row-2">
+        <div><label class="form-label">지역</label>
+          <select id="ec_region">${REGIONS.map(r=>`<option${r===c.region?' selected':''}>${r}</option>`).join('')}</select></div>
+        <div><label class="form-label">상담일</label>
+          <input type="text" id="ec_date" value="${c.date||''}" autocomplete="off"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-danger" onclick="deleteCustomer('${c.id}')">삭제</button>
+        <button class="btn" onclick="closeModal()">취소</button>
+        <button class="btn btn-primary" id="saveEditBtn" onclick="saveEditCustomer('${c.id}')">저장</button>
+      </div>`);
+  };
+
+  window.openAddProject = () => openModal(`
+    <div class="modal-title">전시회 등록</div>
+    <div class="modal-sub">새로운 전시회 프로젝트를 등록하세요.</div>
+    <div class="form-row"><label class="form-label">전시회명 <span class="req">*</span></label>
+      <input type="text" id="fp_name" placeholder="2025 스마트팩토리 엑스포" autocomplete="off"></div>
+    <div class="form-row"><label class="form-label">개최 장소</label>
+      <input type="text" id="fp_loc" placeholder="서울 COEX A홀" autocomplete="off"></div>
+    <div class="form-row-2">
+      <div><label class="form-label">시작일</label>
+        <input type="date" id="fp_date_from" value="${today()}"></div>
+      <div><label class="form-label">종료일</label>
+        <input type="date" id="fp_date_to" value="${today()}"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn" onclick="closeModal()">취소</button>
+      <button class="btn btn-primary" onclick="saveProject()">등록</button>
+    </div>`);
+
+  // ── View switching ─────────────────────────
+  window.setView = v => {
+    $('viewCustomers').style.display = v==='customers' ? 'block' : 'none';
+    $('viewProjects').style.display  = v==='projects'  ? 'block' : 'none';
+    $('nav0').classList.toggle('active', v==='customers');
+    $('nav1').classList.toggle('active', v==='projects');
+    if (v==='projects') renderProjectsPage();
+    else { renderStats(); renderTable(); }
+  };
+
+  function renderProjectsPage() {
+    $('topbarTitle').textContent = '전시회 관리';
+    $('topbarMeta').textContent  = '프로젝트 등록 및 관리';
+    $('detailPanel').style.display = 'none';
+    $('viewProjects').innerHTML = `
+      <div class="section-header" style="margin-bottom:14px;">
+        <div class="section-title">전시회 목록 (${projects.length})</div>
+        <button class="btn btn-primary" onclick="openAddProject()">+ 전시회 등록</button>
+      </div>
+      ${projects.map(p=>{
+        const dateRange = p.dateFrom ? (p.dateTo && p.dateTo!==p.dateFrom ? `${p.dateFrom} ~ ${p.dateTo}` : p.dateFrom) : (p.date||'');
+        return `<div class="project-card">
+          <div>
+            <div style="font-weight:600;font-size:15px;">${p.name}</div>
+            <div style="font-size:12px;color:#999;margin-top:3px;">${p.location||''} ${dateRange?'· '+dateRange:''}</div>
+            <div style="font-size:13px;color:#555;margin-top:5px;">고객 ${customers.filter(c=>c.projectId===p.id).length}명</div>
+          </div>
+          <div style="display:flex;gap:8px;">
+            <button class="btn" style="font-size:12px;" onclick="selectProject('${p.id}')">고객 보기</button>
+            <button class="btn btn-danger" style="font-size:12px;" onclick="deleteProject('${p.id}')">삭제</button>
+          </div>
+        </div>`;
+      }).join('')||'<div class="empty-state">등록된 전시회가 없습니다.</div>'}`;
+  }
+
+  document.addEventListener('keydown', e => {
+    if (e.key==='Enter' && e.target.id==='authEmail') $('authPw').focus();
+    if (e.key==='Enter' && e.target.id==='authPw')    doLogin();
+  });
+</script>
+
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --green:   #1D9E75; --green-d: #0F6E56; --green-l: #E1F5EE; --green-m: #9FE1CB;
+  --danger:  #E24B4A; --danger-l:#FCEBEB;
+  --bg:      #F4F3EF; --surface: #FFFFFF;
+  --border:  rgba(0,0,0,0.08); --border2: rgba(0,0,0,0.13);
+  --c-text:  #1A1A1A; --c-text2: #555; --c-muted: #999;
+  --radius:  10px; --radius-lg: 14px;
+  font-family: 'Pretendard', 'Apple SD Gothic Neo', sans-serif;
+}
+body { background: var(--bg); color: var(--c-text); min-height: 100vh; }
+
+/* Auth */
+#authScreen { min-height:100vh; display:flex; align-items:center; justify-content:center; background:linear-gradient(135deg,#0a3d2b 0%,#1D9E75 100%); }
+.auth-card { background:var(--surface); border-radius:18px; padding:40px 36px; width:380px; max-width:95vw; box-shadow:0 24px 64px rgba(0,0,0,0.18); }
+.auth-logo { display:flex; align-items:center; gap:10px; margin-bottom:28px; }
+.auth-logo-dot { width:10px; height:10px; border-radius:50%; background:var(--green); }
+.auth-logo-text { font-size:18px; font-weight:600; letter-spacing:-0.5px; }
+.auth-title { font-size:22px; font-weight:600; margin-bottom:6px; }
+.auth-sub { font-size:13px; color:var(--c-muted); margin-bottom:24px; }
+.auth-switch { font-size:13px; color:var(--c-muted); margin-top:16px; text-align:center; }
+.auth-switch a { color:var(--green); cursor:pointer; text-decoration:underline; }
+
+/* App */
+#appScreen { display:flex; height:100vh; }
+.sidebar { width:220px; min-width:220px; background:var(--surface); border-right:1px solid var(--border); display:flex; flex-direction:column; }
+.sidebar-top { padding:20px 16px 14px; border-bottom:1px solid var(--border); }
+.logo { font-size:15px; font-weight:600; display:flex; align-items:center; gap:8px; letter-spacing:-0.3px; }
+.logo-dot { width:9px; height:9px; border-radius:50%; background:var(--green); }
+.sidebar-section { padding:14px 10px 4px; }
+.sidebar-label { font-size:10px; font-weight:600; color:var(--c-muted); text-transform:uppercase; letter-spacing:0.8px; padding:0 6px; margin-bottom:4px; }
+.nav-item { display:flex; align-items:center; gap:8px; padding:8px 10px; border-radius:var(--radius); cursor:pointer; font-size:13px; color:var(--c-text2); transition:background 0.15s; }
+.nav-item:hover { background:var(--bg); }
+.nav-item.active { background:var(--green-l); color:var(--green-d); font-weight:600; }
+.project-list { padding:8px 10px; flex:1; overflow-y:auto; }
+.project-chip { display:flex; align-items:center; justify-content:space-between; padding:7px 10px; border-radius:var(--radius); cursor:pointer; font-size:12px; color:var(--c-text2); transition:background 0.15s; margin-bottom:2px; }
+.project-chip:hover { background:var(--bg); }
+.project-chip.active { background:var(--green-l); color:var(--green-d); font-weight:600; }
+.project-chip-name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.project-count { font-size:10px; padding:1px 6px; background:var(--bg); border-radius:8px; color:var(--c-muted); margin-left:4px; }
+.project-chip.active .project-count { background:var(--green-m); color:var(--green-d); }
+.sidebar-bottom { padding:12px 10px; border-top:1px solid var(--border); }
+.user-chip { display:flex; align-items:center; gap:10px; padding:8px 10px; border-radius:var(--radius); }
+.s-avatar { width:30px; height:30px; border-radius:50%; background:var(--green-l); color:var(--green-d); display:flex; align-items:center; justify-content:center; font-size:11px; font-weight:600; flex-shrink:0; }
+.logout-btn { font-size:11px; color:var(--c-muted); cursor:pointer; padding:2px 4px; border-radius:4px; display:inline-block; margin-top:2px; }
+.logout-btn:hover { color:var(--danger); background:var(--danger-l); }
+
+/* Main */
+.main { flex:1; display:flex; flex-direction:column; overflow:hidden; }
+.topbar { background:var(--surface); border-bottom:1px solid var(--border); padding:0 24px; height:54px; display:flex; align-items:center; justify-content:space-between; flex-shrink:0; }
+.topbar-title { font-size:15px; font-weight:600; }
+.topbar-meta { font-size:12px; color:var(--c-muted); margin-top:1px; }
+.topbar-actions { display:flex; align-items:center; gap:8px; }
+.search-bar { display:flex; align-items:center; gap:8px; background:var(--bg); border:1px solid var(--border); border-radius:var(--radius); padding:7px 12px; max-width:280px; }
+.search-bar input { border:none; background:transparent; outline:none; font-size:13px; color:var(--c-text); font-family:inherit; width:200px; }
+.content { flex:1; overflow-y:auto; padding:22px 26px; }
+.stats-row { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin-bottom:22px; }
+.stat-card { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius-lg); padding:14px 16px; }
+.stat-label { font-size:11px; color:var(--c-muted); margin-bottom:4px; }
+.stat-value { font-size:24px; font-weight:600; }
+.stat-sub { font-size:11px; color:var(--c-muted); margin-top:2px; }
+.section-header { display:flex; align-items:center; justify-content:space-between; margin-bottom:12px; }
+.section-title { font-size:13px; font-weight:600; color:var(--c-text2); }
+
+/* Table */
+.customer-table { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius-lg); overflow:hidden; }
+.table-head { display:grid; grid-template-columns:36px 1.5fr 1.5fr 1fr 1fr 110px 60px 80px; padding:0 14px; height:36px; align-items:center; background:var(--bg); border-bottom:1px solid var(--border); font-size:11px; font-weight:600; color:var(--c-muted); text-transform:uppercase; letter-spacing:0.5px; gap:8px; }
+.table-row { display:grid; grid-template-columns:36px 1.5fr 1.5fr 1fr 1fr 110px 60px 80px; padding:0 14px; min-height:46px; align-items:center; border-bottom:1px solid var(--border); cursor:pointer; transition:background 0.12s; font-size:13px; gap:8px; }
+.table-row:last-child { border-bottom:none; }
+.table-row:hover { background:var(--bg); }
+.table-row.selected { background:var(--green-l); }
+.cust-name-cell { display:flex; align-items:center; gap:9px; min-width:0; }
+.cust-avatar { width:28px; height:28px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:10px; font-weight:600; flex-shrink:0; }
+.cust-name { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.cust-org { color:var(--c-text2); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.region-badge { display:inline-block; font-size:11px; padding:2px 8px; border-radius:8px; background:var(--bg); color:var(--c-muted); }
+.date-text { font-size:12px; color:var(--c-muted); }
+.memo-count { font-size:11px; padding:2px 8px; border-radius:8px; background:var(--bg); color:var(--c-muted); }
+.empty-state { text-align:center; padding:48px 20px; color:var(--c-muted); font-size:13px; }
+
+/* Buttons */
+.btn { padding:8px 14px; border-radius:var(--radius); font-size:13px; cursor:pointer; border:1px solid var(--border2); background:var(--surface); color:var(--c-text); display:inline-flex; align-items:center; gap:6px; transition:background 0.15s; font-family:inherit; font-weight:500; }
+.btn:hover { background:var(--bg); }
+.btn-primary { background:var(--green); color:#fff; border-color:var(--green); }
+.btn-primary:hover { background:var(--green-d); border-color:var(--green-d); }
+.btn-danger { color:var(--danger); border-color:var(--danger); }
+.btn-danger:hover { background:var(--danger-l); }
+.btn:disabled { opacity:0.6; cursor:not-allowed; }
+
+/* Forms */
+.form-row { margin-bottom:14px; }
+.form-row-2 { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:14px; }
+.form-label { font-size:12px; font-weight:600; color:var(--c-text2); margin-bottom:5px; display:block; }
+.req { color:var(--danger); }
+input[type=text], input[type=date], select, textarea { width:100%; font-size:13px; border:1px solid var(--border2); border-radius:var(--radius); background:var(--surface); color:var(--c-text); padding:8px 11px; font-family:inherit; }
+input[type=text]:focus, input[type=date]:focus, select:focus, textarea:focus { outline:none; border-color:var(--green); box-shadow:0 0 0 3px rgba(29,158,117,0.12); }
+textarea { resize:vertical; min-height:90px; line-height:1.5; }
+
+/* Modal */
+.modal-overlay { position:fixed; inset:0; background:rgba(0,0,0,0.45); display:flex; align-items:center; justify-content:center; z-index:200; }
+.modal { background:var(--surface); border-radius:var(--radius-lg); width:500px; max-width:96vw; max-height:88vh; overflow-y:auto; padding:28px; box-shadow:0 24px 64px rgba(0,0,0,0.22); }
+.modal-title { font-size:17px; font-weight:600; margin-bottom:4px; }
+.modal-sub { font-size:12px; color:var(--c-muted); margin-bottom:22px; }
+.modal-footer { display:flex; justify-content:flex-end; gap:8px; margin-top:22px; border-top:1px solid var(--border); padding-top:18px; }
+
+/* Detail */
+#detailPanel { width:340px; min-width:340px; background:var(--surface); border-left:1px solid var(--border); display:flex; flex-direction:column; overflow-y:auto; flex-shrink:0; }
+.detail-header { padding:22px 20px 16px; border-bottom:1px solid var(--border); display:flex; align-items:flex-start; justify-content:space-between; }
+.detail-avatar-lg { width:52px; height:52px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:18px; font-weight:600; margin-bottom:10px; }
+.detail-name { font-size:17px; font-weight:600; }
+.detail-org { font-size:13px; color:var(--c-text2); margin-top:2px; }
+.detail-body { padding:16px 20px; border-bottom:1px solid var(--border); }
+.detail-meta-row { display:flex; align-items:center; gap:8px; margin-bottom:8px; font-size:13px; }
+.detail-meta-label { color:var(--c-muted); width:48px; flex-shrink:0; font-size:12px; }
+.memo-section { padding:16px 20px; flex:1; }
+.memo-section-title { font-size:11px; font-weight:600; color:var(--c-muted); text-transform:uppercase; letter-spacing:0.5px; margin-bottom:12px; }
+.memo-item { padding:10px 13px; border-radius:var(--radius); background:var(--bg); margin-bottom:8px; font-size:13px; }
+.memo-date { font-size:10px; color:var(--c-muted); margin-top:5px; }
+
+/* Project card */
+.project-card { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius-lg); padding:18px 22px; margin-bottom:10px; display:flex; align-items:center; justify-content:space-between; }
+
+/* Toast */
+#toast { position:fixed; bottom:24px; left:50%; transform:translateX(-50%); background:#1a1a1a; color:#fff; padding:10px 20px; border-radius:var(--radius); font-size:13px; z-index:999; opacity:0; transition:opacity 0.25s; pointer-events:none; white-space:nowrap; }
+#toast.show { opacity:1; }
+</style>
+</head>
+<body>
+
+<!-- Auth -->
+<div id="authScreen">
+  <div class="auth-card">
+    <div class="auth-logo"><div class="auth-logo-dot"></div><div class="auth-logo-text">ExhibitCRM</div></div>
+    <div id="loginBox">
+      <div class="auth-title">로그인</div>
+      <div class="auth-sub">팀 계정으로 로그인하세요.</div>
+      <div class="form-row"><label class="form-label">이메일</label><input type="text" id="authEmail" placeholder="hong@company.com"></div>
+      <div class="form-row"><label class="form-label">비밀번호</label><input type="text" id="authPw" placeholder="비밀번호" style="-webkit-text-security:disc;"></div>
+      <button class="btn btn-primary" style="width:100%;justify-content:center;padding:12px;" onclick="doLogin()">로그인</button>
+      <div class="auth-switch">계정이 없으신가요? <a onclick="showRegister()">회원가입</a></div>
+    </div>
+    <div id="registerBox" style="display:none;">
+      <div class="auth-title">회원가입</div>
+      <div class="auth-sub">영업사원 계정을 생성하세요.</div>
+      <div class="form-row"><label class="form-label">이름 <span class="req">*</span></label><input type="text" id="regName" placeholder="홍길동"></div>
+      <div class="form-row"><label class="form-label">이메일 <span class="req">*</span></label><input type="text" id="regEmail" placeholder="hong@company.com"></div>
+      <div class="form-row"><label class="form-label">비밀번호 <span class="req">*</span></label><input type="text" id="regPw" placeholder="6자 이상" style="-webkit-text-security:disc;"></div>
+      <button class="btn btn-primary" style="width:100%;justify-content:center;padding:12px;" onclick="doRegister()">가입하기</button>
+      <div class="auth-switch">이미 계정이 있으신가요? <a onclick="showLogin()">로그인</a></div>
+    </div>
+  </div>
+</div>
+
+<!-- App -->
+<div id="appScreen" style="display:none;">
+  <div class="sidebar">
+    <div class="sidebar-top">
+      <div class="logo"><div class="logo-dot"></div>ExhibitCRM</div>
+    </div>
+    <div class="sidebar-section">
+      <div class="sidebar-label">메뉴</div>
+      <div class="nav-item active" id="nav0" onclick="setView('customers')"><span style="font-size:14px;">👥</span>고객 목록</div>
+      <div class="nav-item" id="nav1" onclick="setView('projects')"><span style="font-size:14px;">📋</span>전시회 관리</div>
+    </div>
+    <div class="sidebar-section" style="flex:1;overflow:hidden;display:flex;flex-direction:column;">
+      <div class="sidebar-label">전시회</div>
+      <div class="project-list" id="projectList"><div style="font-size:12px;color:#999;padding:6px 8px;">불러오는 중...</div></div>
+    </div>
+    <div class="sidebar-bottom">
+      <div class="user-chip">
+        <div class="s-avatar" id="userAvatar">??</div>
+        <div style="flex:1;min-width:0;">
+          <div style="font-size:12px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" id="userDisplayName">—</div>
+          <div id="adminBadge" style="display:none;font-size:10px;font-weight:600;color:#0F6E56;background:#E1F5EE;padding:1px 7px;border-radius:8px;margin-top:2px;width:fit-content;">관리자</div>
+          <div class="logout-btn" onclick="doLogout()">로그아웃</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="main">
+    <div class="topbar">
+      <div>
+        <div class="topbar-title" id="topbarTitle">전시회를 선택하세요</div>
+        <div class="topbar-meta" id="topbarMeta"></div>
+      </div>
+      <div class="topbar-actions">
+        <div class="search-bar">
+          <span style="font-size:13px;color:#bbb;">🔍</span>
+          <input type="text" id="searchInput" placeholder="이름, 소속 검색..." oninput="renderTable()">
+        </div>
+        <button class="btn btn-primary" onclick="openAddCustomer()">+ 고객 추가</button>
+      </div>
+    </div>
+    <div class="content">
+      <div id="viewCustomers">
+        <div class="stats-row" id="statsRow"></div>
+        <div class="section-header">
+          <div class="section-title" id="sectionTitle">고객 목록</div>
+        </div>
+        <div class="customer-table" id="customerTable">
+          <div class="empty-state">전시회를 선택하면 고객 목록이 표시됩니다.</div>
+        </div>
+      </div>
+      <div id="viewProjects" style="display:none;"></div>
+    </div>
+  </div>
+
+  <div id="detailPanel" style="display:none;"></div>
+</div>
+
+<div class="modal-overlay" id="modalOverlay" style="display:none;" onclick="if(event.target===this)closeModal()">
+  <div class="modal" id="modal"></div>
+</div>
+
+<div id="toast"></div>
+</body>
+</html>
