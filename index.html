@@ -136,8 +136,7 @@
       const rows = all.map((c, i) => {
         const dt = c.createdAt?.toDate ? c.createdAt.toDate() : null;
         const dtStr = dt ? dt.toLocaleDateString('ko-KR') + ' ' + dt.toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'}) : '—';
-        const memos = (c.memos||[]).map(m=>`[${m.date||''} ${m.time||''} ${m.author||''}] ${m.text}`).join('
-');
+        const memos = (c.memos||[]).map(m=>m.text||'').join(' / ');
         return [
           i+1,
           c.name||'',
@@ -182,7 +181,8 @@
       XLSX.utils.book_append_sheet(wb, ws, p.name.slice(0,30));
 
       // 다운로드
-      const fileName = `${p.name}_고객목록_${new Date().toLocaleDateString('ko-KR').replace(/\. /g,'-').replace('.','')}.xlsx`;
+      const dateStr = new Date().toISOString().split('T')[0];
+      const fileName = p.name.replace(/[/\\:*?"<>|]/g,'_') + '_고객목록_' + dateStr + '.xlsx';
       XLSX.writeFile(wb, fileName);
       toast(`📥 ${all.length}명 데이터가 다운로드되었습니다.`);
     } catch(e) {
