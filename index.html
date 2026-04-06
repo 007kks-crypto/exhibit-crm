@@ -5,6 +5,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
 <title>ExhibitCRM</title>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=Pretendard:wght@400;500;600&display=swap" rel="stylesheet">
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
@@ -109,6 +110,88 @@
       toast(`${name}님, 환영합니다!`);
     } catch(e) { toast('가입 실패: '+(e.code==='auth/email-already-in-use'?'이미 사용 중인 이메일입니다.':e.message)); }
   };
+  // ── Excel Export ──────────────────────────
+  window.exportExcel = async () => {
+    if (!activeProject) { toast('전시회를 먼저 선택하세요.'); return; }
+    const p = projects.find(x=>x.id===activeProject);
+    const btn = $('exportBtn');
+    if (btn) { btn.disabled=true; btn.textContent='생성 중...'; }
+
+    try {
+      // 관리자는 전체, 일반사원은 본인 것만
+      const q = query(collection(db,'customers'), where('projectId','==',activeProject));
+      const snap = await new Promise(res => { const u = onSnapshot(q, s=>{u();res(s);}); });
+      let all = snap.docs.map(d=>({id:d.id,...d.data()}));
+      if (!isAdmin()) all = all.filter(c=>c.createdBy===currentUser.uid);
+      all.sort((a,b)=>(a.createdAt?.seconds||0)-(b.createdAt?.seconds||0));
+
+      if (!all.length) { toast('내보낼 고객 데이터가 없습니다.'); return; }
+
+      const dr = p.dateFrom?(p.dateTo&&p.dateTo!==p.dateFrom?`${p.dateFrom}~${p.dateTo}`:p.dateFrom):(p.date||'');
+
+      // 헤더
+      const headers = ['번호','고객명','소속','지역','상담일','등록일시','담당자','명함여부','메모수','상담내용(최신순)'];
+
+      // 데이터 행
+      const rows = all.map((c, i) => {
+        const dt = c.createdAt?.toDate ? c.createdAt.toDate() : null;
+        const dtStr = dt ? dt.toLocaleDateString('ko-KR') + ' ' + dt.toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'}) : '—';
+        const memos = (c.memos||[]).map(m=>`[${m.date||''} ${m.time||''} ${m.author||''}] ${m.text}`).join('
+');
+        return [
+          i+1,
+          c.name||'',
+          c.org||'',
+          c.region||'',
+          c.date||'',
+          dtStr,
+          c.authorName||'',
+          c.cardImage?'등록':'미등록',
+          (c.memos||[]).length,
+          memos
+        ];
+      });
+
+      // 워크북 생성
+      const wb = XLSX.utils.book_new();
+      const wsData = [
+        [`전시회: ${p.name}`, '', '', '', '', '', '', '', '', ''],
+        [`기간: ${dr}`, '', '', '', '', '', '', '', '', ''],
+        [`추출일시: ${new Date().toLocaleDateString('ko-KR')} ${new Date().toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'})}`, '', '', '', '', '', '', '', '', ''],
+        [`총 고객수: ${all.length}명`, '', '', '', '', '', '', '', '', ''],
+        [],
+        headers,
+        ...rows
+      ];
+      const ws = XLSX.utils.aoa_to_sheet(wsData);
+
+      // 열 너비 설정
+      ws['!cols'] = [
+        {wch:5},{wch:12},{wch:18},{wch:8},{wch:12},
+        {wch:18},{wch:14},{wch:8},{wch:6},{wch:50}
+      ];
+
+      // 병합 (제목 행)
+      ws['!merges'] = [
+        {s:{r:0,c:0},e:{r:0,c:9}},
+        {s:{r:1,c:0},e:{r:1,c:9}},
+        {s:{r:2,c:0},e:{r:2,c:9}},
+        {s:{r:3,c:0},e:{r:3,c:9}},
+      ];
+
+      XLSX.utils.book_append_sheet(wb, ws, p.name.slice(0,30));
+
+      // 다운로드
+      const fileName = `${p.name}_고객목록_${new Date().toLocaleDateString('ko-KR').replace(/\. /g,'-').replace('.','')}.xlsx`;
+      XLSX.writeFile(wb, fileName);
+      toast(`📥 ${all.length}명 데이터가 다운로드되었습니다.`);
+    } catch(e) {
+      toast('내보내기 실패: '+e.message); console.error(e);
+    } finally {
+      if (btn) { btn.disabled=false; btn.textContent='📥 엑셀 다운로드'; }
+    }
+  };
+
   window.doLogout    = () => signOut(auth);
   window.showLogin   = () => { $('loginBox').style.display='block';  $('registerBox').style.display='none'; };
   window.showRegister= () => { $('loginBox').style.display='none';   $('registerBox').style.display='block'; };
@@ -213,6 +296,8 @@
     loadCustomers(pid);
     loadPriceList(pid);
     if (isMobile()) closeSidebar();
+    const exportBtn = $('exportBtn');
+    if (exportBtn) exportBtn.style.display = 'inline-flex';
   };
 
   function loadCustomers(pid) {
@@ -656,6 +741,8 @@
 
   // ── View switching ────────────────────────
   window.setView = v => {
+    const exportBtn=$('exportBtn');
+    if (exportBtn) exportBtn.style.display=(v==='customers'&&activeProject)?'inline-flex':'none';
     ['viewCustomers','viewProjects','viewCards','viewPrice','viewNotices'].forEach(id=>$(id).style.display='none');
     $('view'+v.charAt(0).toUpperCase()+v.slice(1)).style.display='block';
     ['nav0','nav1','nav2','nav3','nav4'].forEach((id,i)=>$(id)&&$(id).classList.toggle('active',
@@ -984,6 +1071,7 @@ textarea{resize:vertical;min-height:80px;line-height:1.5;}
           <span style="font-size:12px;color:#bbb;">🔍</span>
           <input type="text" id="searchInput" placeholder="검색..." oninput="renderTable()">
         </div>
+        <button class="btn" id="exportBtn" style="padding:8px 12px;font-size:13px;display:none;" onclick="exportExcel()">📥 엑셀</button>
         <button class="btn btn-primary" style="padding:8px 12px;font-size:13px;" onclick="openAddCustomer()">+ 고객</button>
       </div>
     </div>
