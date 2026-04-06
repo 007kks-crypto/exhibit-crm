@@ -10,7 +10,7 @@
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
   import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile }
     from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
-  import { getFirestore, collection, doc, addDoc, updateDoc, deleteDoc, onSnapshot, query, where, serverTimestamp }
+  import { getFirestore, collection, doc, addDoc, updateDoc, deleteDoc, onSnapshot, query, where, serverTimestamp, orderBy }
     from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 
   const firebaseConfig = {
@@ -38,12 +38,15 @@
   let activeProject  = null;
   let projects       = [];
   let customers      = [];
+  let priceLists     = {};   // pid -> [{id,name,price,released,note}]
+  let notices        = [];
   let selectedCust   = null;
   let unsubCustomers = null;
   let unsubProjects  = null;
+  let unsubNotices   = null;
   let sidebarOpen    = false;
   let cameraStream   = null;
-  let cardImageData  = null; // 현재 등록 중인 명함 이미지 base64
+  let cardImageData  = null;
 
   const col     = s => { let h=0; for(let c of s) h=(h*31+c.charCodeAt(0))%COLORS.length; return COLORS[h]; };
   const ini     = n => n ? n.slice(0,2) : '?';
@@ -52,14 +55,17 @@
   const isAdmin = () => currentUser?.email === ADMIN_EMAIL;
   const isMobile= () => window.innerWidth <= 768;
   const toast   = msg => { const t=$('toast'); t.textContent=msg; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),2800); };
-
-  const fmtDT = ts => {
+  const fmtDT   = ts => {
     if (!ts) return '—';
     try {
       const d = ts.toDate ? ts.toDate() : new Date(ts);
       return d.toLocaleDateString('ko-KR',{month:'2-digit',day:'2-digit'}) + ' ' +
              d.toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'});
     } catch(e) { return '—'; }
+  };
+  const fmtPrice = v => {
+    if (!v && v!==0) return '—';
+    return Number(v).toLocaleString('ko-KR') + '원';
   };
 
   // ── Auth ──────────────────────────────────
@@ -70,7 +76,8 @@
       $('appScreen').style.display  = 'flex';
       $('userDisplayName').textContent = user.displayName || user.email;
       $('userAvatar').textContent = ini(user.displayName || user.email);
-      $('adminBadge').style.display = isAdmin() ? 'inline-block' : 'none';
+      $('adminBadge').style.display  = isAdmin() ? 'inline-block' : 'none';
+      $('nav2').style.display        = isAdmin() ? 'flex' : 'none';
       startApp();
     } else {
       $('authScreen').style.display = 'flex';
@@ -82,7 +89,8 @@
   function cleanup() {
     if (unsubProjects)  { unsubProjects();  unsubProjects  = null; }
     if (unsubCustomers) { unsubCustomers(); unsubCustomers = null; }
-    projects=[]; customers=[]; activeProject=null; selectedCust=null;
+    if (unsubNotices)   { unsubNotices();   unsubNotices   = null; }
+    projects=[]; customers=[]; notices=[]; priceLists={}; activeProject=null; selectedCust=null;
   }
 
   window.doLogin = async () => {
@@ -91,7 +99,6 @@
     try { await signInWithEmailAndPassword(auth,email,pw); }
     catch(e) { toast('로그인 실패: '+(e.code==='auth/invalid-credential'?'이메일 또는 비밀번호를 확인하세요.':e.message)); }
   };
-
   window.doRegister = async () => {
     const name=$('regName').value.trim(), email=$('regEmail').value.trim(), pw=$('regPw').value.trim();
     if (!name||!email||!pw) { toast('모든 항목을 입력하세요.'); return; }
@@ -102,7 +109,6 @@
       toast(`${name}님, 환영합니다!`);
     } catch(e) { toast('가입 실패: '+(e.code==='auth/email-already-in-use'?'이미 사용 중인 이메일입니다.':e.message)); }
   };
-
   window.doLogout    = () => signOut(auth);
   window.showLogin   = () => { $('loginBox').style.display='block';  $('registerBox').style.display='none'; };
   window.showRegister= () => { $('loginBox').style.display='none';   $('registerBox').style.display='block'; };
@@ -114,105 +120,70 @@
     $('sidebarOverlay').style.display=sidebarOpen?'block':'none';
   };
   window.closeSidebar = () => {
-    sidebarOpen=false;
-    $('sidebar').classList.remove('open');
-    $('sidebarOverlay').style.display='none';
+    sidebarOpen=false; $('sidebar').classList.remove('open'); $('sidebarOverlay').style.display='none';
   };
 
   // ── Camera ────────────────────────────────
   window.openCamera = async () => {
-    const wrap = $('cameraWrap');
-    wrap.style.display = 'flex';
+    $('cameraWrap').style.display='flex';
     try {
-      cameraStream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'environment', width:{ideal:1280}, height:{ideal:720} },
-        audio: false
-      });
-      $('cameraVideo').srcObject = cameraStream;
-      await $('cameraVideo').play();
-    } catch(e) {
-      wrap.style.display = 'none';
-      toast('카메라를 사용할 수 없습니다. 갤러리에서 선택해주세요.');
-    }
+      cameraStream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'},audio:false});
+      $('cameraVideo').srcObject=cameraStream; await $('cameraVideo').play();
+    } catch(e) { $('cameraWrap').style.display='none'; toast('카메라를 사용할 수 없습니다. 갤러리에서 선택해주세요.'); }
   };
-
   window.capturePhoto = () => {
-    const video = $('cameraVideo');
-    const canvas = $('cameraCanvas');
-    canvas.width  = video.videoWidth  || 640;
-    canvas.height = video.videoHeight || 480;
-    canvas.getContext('2d').drawImage(video, 0, 0);
-    // 압축: 최대 800px, jpeg 0.75
-    const maxW = 800;
-    const scale = Math.min(1, maxW/canvas.width);
-    const c2 = document.createElement('canvas');
-    c2.width  = Math.round(canvas.width  * scale);
-    c2.height = Math.round(canvas.height * scale);
-    c2.getContext('2d').drawImage(canvas, 0, 0, c2.width, c2.height);
-    cardImageData = c2.toDataURL('image/jpeg', 0.75);
-    closeCamera();
-    updateCardPreview();
-    toast('명함 촬영 완료!');
+    const v=$('cameraVideo'), canvas=$('cameraCanvas');
+    canvas.width=v.videoWidth||640; canvas.height=v.videoHeight||480;
+    canvas.getContext('2d').drawImage(v,0,0);
+    const maxW=800, scale=Math.min(1,maxW/canvas.width);
+    const c2=document.createElement('canvas');
+    c2.width=Math.round(canvas.width*scale); c2.height=Math.round(canvas.height*scale);
+    c2.getContext('2d').drawImage(canvas,0,0,c2.width,c2.height);
+    cardImageData=c2.toDataURL('image/jpeg',0.75);
+    closeCamera(); updateCardPreview(); toast('명함 촬영 완료!');
   };
-
   window.closeCamera = () => {
     if (cameraStream) { cameraStream.getTracks().forEach(t=>t.stop()); cameraStream=null; }
-    $('cameraWrap').style.display = 'none';
+    $('cameraWrap').style.display='none';
   };
-
   window.openGallery = () => $('galleryInput').click();
-
   window.onGallerySelected = input => {
-    const file = input.files[0]; if(!file) return;
-    const reader = new FileReader();
-    reader.onload = e => {
-      // 압축
-      const img = new Image();
-      img.onload = () => {
-        const maxW = 800;
-        const scale = Math.min(1, maxW/img.width);
-        const c = document.createElement('canvas');
-        c.width  = Math.round(img.width  * scale);
-        c.height = Math.round(img.height * scale);
-        c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
-        cardImageData = c.toDataURL('image/jpeg', 0.75);
-        updateCardPreview();
-        toast('명함 사진 선택 완료!');
+    const file=input.files[0]; if(!file) return;
+    const reader=new FileReader();
+    reader.onload=e=>{
+      const img=new Image();
+      img.onload=()=>{
+        const maxW=800, scale=Math.min(1,maxW/img.width);
+        const c=document.createElement('canvas');
+        c.width=Math.round(img.width*scale); c.height=Math.round(img.height*scale);
+        c.getContext('2d').drawImage(img,0,0,c.width,c.height);
+        cardImageData=c.toDataURL('image/jpeg',0.75);
+        updateCardPreview(); toast('명함 사진 선택 완료!');
       };
-      img.src = e.target.result;
+      img.src=e.target.result;
     };
-    reader.readAsDataURL(file);
-    input.value = '';
+    reader.readAsDataURL(file); input.value='';
   };
-
   function updateCardPreview() {
-    const preview = $('cardPreview');
-    if (!preview) return;
-    if (cardImageData) {
-      preview.innerHTML = `
-        <div style="position:relative;display:inline-block;width:100%;">
-          <img src="${cardImageData}" style="width:100%;max-height:160px;object-fit:cover;border-radius:10px;display:block;">
-          <button onclick="removeCardImage()" style="position:absolute;top:6px;right:6px;background:rgba(0,0,0,0.55);color:#fff;border:none;border-radius:50%;width:26px;height:26px;font-size:14px;cursor:pointer;display:flex;align-items:center;justify-content:center;">✕</button>
-        </div>`;
-    } else {
-      preview.innerHTML = cardEmptyHtml();
-    }
+    const preview=$('cardPreview'); if(!preview) return;
+    preview.innerHTML = cardImageData ? `
+      <div style="position:relative;display:inline-block;width:100%;">
+        <img src="${cardImageData}" style="width:100%;max-height:160px;object-fit:cover;border-radius:10px;display:block;">
+        <button onclick="removeCardImage()" style="position:absolute;top:6px;right:6px;background:rgba(0,0,0,0.55);color:#fff;border:none;border-radius:50%;width:26px;height:26px;font-size:14px;cursor:pointer;display:flex;align-items:center;justify-content:center;">✕</button>
+      </div>` : cardEmptyHtml();
   }
-
   window.removeCardImage = () => { cardImageData=null; updateCardPreview(); };
-
   function cardEmptyHtml() {
-    return `
-      <div style="border:1.5px dashed rgba(0,0,0,0.15);border-radius:10px;padding:20px;display:flex;flex-direction:column;align-items:center;gap:12px;background:#fafafa;">
-        <div style="font-size:13px;color:#999;">명함 사진 등록 (선택)</div>
-        <div style="display:flex;gap:10px;">
-          <button type="button" class="btn" style="font-size:13px;padding:8px 14px;" onclick="openCamera()">📷 카메라 촬영</button>
-          <button type="button" class="btn" style="font-size:13px;padding:8px 14px;" onclick="openGallery()">🖼 갤러리 선택</button>
-        </div>
-      </div>`;
+    return `<div style="border:1.5px dashed rgba(0,0,0,0.15);border-radius:10px;padding:18px;display:flex;flex-direction:column;align-items:center;gap:10px;background:#fafafa;">
+      <div style="font-size:13px;color:#999;">명함 사진 등록 (선택)</div>
+      <div style="display:flex;gap:10px;">
+        <button type="button" class="btn" style="font-size:12px;padding:7px 12px;" onclick="openCamera()">📷 카메라 촬영</button>
+        <button type="button" class="btn" style="font-size:12px;padding:7px 12px;" onclick="openGallery()">🖼 갤러리 선택</button>
+      </div>
+    </div>`;
   }
 
-  // ── App ───────────────────────────────────
+  // ── App Start ─────────────────────────────
   function startApp() {
     unsubProjects = onSnapshot(collection(db,'projects'), snap => {
       projects = snap.docs.map(d=>({id:d.id,...d.data()}))
@@ -220,8 +191,14 @@
       renderProjectList();
       if (!activeProject && projects.length) selectProject(projects[0].id);
     });
+    // notices 실시간 구독
+    unsubNotices = onSnapshot(query(collection(db,'notices'), orderBy('createdAt','desc')), snap => {
+      notices = snap.docs.map(d=>({id:d.id,...d.data()}));
+      if ($('viewNotices').style.display!=='none') renderNoticesPage();
+    });
   }
 
+  // ── Projects ──────────────────────────────
   window.selectProject = pid => {
     activeProject=pid; selectedCust=null;
     $('detailPanel').style.display='none';
@@ -234,24 +211,27 @@
     }
     setView('customers');
     loadCustomers(pid);
+    loadPriceList(pid);
     if (isMobile()) closeSidebar();
   };
 
   function loadCustomers(pid) {
     if (unsubCustomers) { unsubCustomers(); unsubCustomers=null; }
-    const q = query(collection(db,'customers'), where('projectId','==',pid));
-    unsubCustomers = onSnapshot(q, snap => {
-      let all = snap.docs.map(d=>({id:d.id,...d.data()}));
+    const q=query(collection(db,'customers'),where('projectId','==',pid));
+    unsubCustomers=onSnapshot(q,snap=>{
+      let all=snap.docs.map(d=>({id:d.id,...d.data()}));
       if (!isAdmin()) all=all.filter(c=>c.createdBy===currentUser.uid);
       all.sort((a,b)=>(b.createdAt?.seconds||0)-(a.createdAt?.seconds||0));
-      customers=all;
-      renderStats(); renderTable();
-      if (selectedCust) {
-        const still=customers.find(x=>x.id===selectedCust);
-        if (still) renderDetail(selectedCust);
-        else { $('detailPanel').style.display='none'; selectedCust=null; }
-      }
+      customers=all; renderStats(); renderTable();
+      if (selectedCust) { const s=customers.find(x=>x.id===selectedCust); if(s) renderDetail(selectedCust); else { $('detailPanel').style.display='none'; selectedCust=null; } }
     });
+  }
+
+  async function loadPriceList(pid) {
+    const q=query(collection(db,'priceLists'),where('projectId','==',pid));
+    const snap=await new Promise(res=>{ const u=onSnapshot(q,s=>{u();res(s);}); });
+    priceLists[pid]=snap.docs.map(d=>({id:d.id,...d.data()}))
+      .sort((a,b)=>(a.order||0)-(b.order||0));
   }
 
   window.saveProject = async () => {
@@ -260,27 +240,19 @@
     const dateFrom=$('fp_date_from').value, dateTo=$('fp_date_to').value;
     if (dateFrom&&dateTo&&dateTo<dateFrom) { toast('종료일은 시작일보다 이후여야 합니다.'); return; }
     try {
-      await addDoc(collection(db,'projects'),{
-        name, location:$('fp_loc').value.trim()||'', dateFrom, dateTo,
-        createdBy:currentUser.uid, createdAt:serverTimestamp()
-      });
+      await addDoc(collection(db,'projects'),{name,location:$('fp_loc').value.trim()||'',dateFrom,dateTo,createdBy:currentUser.uid,createdAt:serverTimestamp()});
       closeModal(); toast(`"${name}" 전시회가 등록되었습니다.`);
     } catch(e) { toast('저장 실패: '+e.message); }
   };
-
   window.deleteProject = async pid => {
     if (customers.some(c=>c.projectId===pid)) { toast('고객이 있는 전시회는 삭제할 수 없습니다.'); return; }
     if (!confirm('전시회를 삭제하시겠습니까?')) return;
     await deleteDoc(doc(db,'projects',pid));
-    if (activeProject===pid) {
-      activeProject=null; customers=[];
-      $('topbarTitle').textContent='전시회를 선택하세요';
-      $('topbarMeta').textContent='';
-      renderStats(); renderTable();
-    }
+    if (activeProject===pid) { activeProject=null; customers=[]; $('topbarTitle').textContent='전시회를 선택하세요'; $('topbarMeta').textContent=''; renderStats(); renderTable(); }
     toast('삭제되었습니다.');
   };
 
+  // ── Customers ─────────────────────────────
   window.saveNewCustomer = async () => {
     const name=$('fc_name').value.trim(), org=$('fc_org').value.trim();
     if (!name) { toast('고객명을 입력하세요.'); return; }
@@ -291,42 +263,34 @@
     const btn=$('saveNewBtn'); btn.disabled=true; btn.textContent='저장 중...';
     try {
       await addDoc(collection(db,'customers'),{
-        name, org,
-        region:    $('fc_region').value,
-        date:      $('fc_date').value||today(),
-        cardImage: cardImageData||null,
-        memos:     memo?[{text:memo,date:today(),time:new Date().toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'}),author:currentUser.displayName||currentUser.email}]:[],
-        projectId: selPid,
-        createdBy: currentUser.uid,
-        authorName:currentUser.displayName||currentUser.email,
-        createdAt: serverTimestamp()
+        name,org,region:$('fc_region').value,date:$('fc_date').value||today(),
+        cardImage:cardImageData||null,
+        memos:memo?[{text:memo,date:today(),time:new Date().toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'}),author:currentUser.displayName||currentUser.email}]:[],
+        projectId:selPid,createdBy:currentUser.uid,authorName:currentUser.displayName||currentUser.email,createdAt:serverTimestamp()
       });
       if (selPid!==activeProject) selectProject(selPid);
       closeModal(); toast(`${name} 고객이 등록되었습니다.`);
     } catch(e) { toast('저장 실패: '+e.message); console.error(e); }
     finally { if($('saveNewBtn')){ btn.disabled=false; btn.textContent='저장'; } }
   };
-
   window.saveEditCustomer = async cid => {
     const name=$('ec_name').value.trim(), org=$('ec_org').value.trim();
     if (!name) { toast('고객명을 입력하세요.'); return; }
     if (!org)  { toast('소속을 입력하세요.'); return; }
     const btn=$('saveEditBtn'); btn.disabled=true; btn.textContent='저장 중...';
     try {
-      const updates = {name, org, region:$('ec_region').value, date:$('ec_date').value};
-      if (cardImageData !== undefined) updates.cardImage = cardImageData;
-      await updateDoc(doc(db,'customers',cid), updates);
+      const updates={name,org,region:$('ec_region').value,date:$('ec_date').value};
+      if (cardImageData!==undefined) updates.cardImage=cardImageData;
+      await updateDoc(doc(db,'customers',cid),updates);
       closeModal(); toast('저장되었습니다.');
     } catch(e) { toast('저장 실패: '+e.message); }
     finally { if($('saveEditBtn')){ btn.disabled=false; btn.textContent='저장'; } }
   };
-
   window.deleteCustomer = async cid => {
     if (!confirm('정말 삭제하시겠습니까?')) return;
     await deleteDoc(doc(db,'customers',cid));
     selectedCust=null; closeModal(); $('detailPanel').style.display='none'; toast('삭제되었습니다.');
   };
-
   window.addMemo = async cid => {
     const txt=$('newMemoText').value.trim();
     if (!txt) { toast('내용을 입력하세요.'); return; }
@@ -334,6 +298,145 @@
     const memos=[{text:txt,date:today(),time:new Date().toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'}),author:currentUser.displayName||currentUser.email},...(c.memos||[])];
     await updateDoc(doc(db,'customers',cid),{memos});
     toast('메모가 저장되었습니다.');
+  };
+
+  // ── Price List ────────────────────────────
+  window.savePriceItem = async () => {
+    if (!isAdmin()) return;
+    const name=$('pi_name').value.trim();
+    if (!name) { toast('제품명을 입력하세요.'); return; }
+    const priceRaw=$('pi_price').value.replace(/[^0-9]/g,'');
+    const item={
+      name, price:priceRaw?Number(priceRaw):null,
+      released:$('pi_released').value,
+      note:$('pi_note').value.trim(),
+      projectId:activeProject, order:Date.now(),
+      createdAt:serverTimestamp()
+    };
+    try {
+      await addDoc(collection(db,'priceLists'),item);
+      await loadPriceList(activeProject);
+      closeModal(); renderPriceListPage(); toast('제품이 추가되었습니다.');
+    } catch(e) { toast('저장 실패: '+e.message); }
+  };
+  window.updatePriceItem = async id => {
+    if (!isAdmin()) return;
+    const name=$('pi_name').value.trim();
+    if (!name) { toast('제품명을 입력하세요.'); return; }
+    const priceRaw=$('pi_price').value.replace(/[^0-9]/g,'');
+    try {
+      await updateDoc(doc(db,'priceLists',id),{
+        name, price:priceRaw?Number(priceRaw):null,
+        released:$('pi_released').value, note:$('pi_note').value.trim()
+      });
+      await loadPriceList(activeProject);
+      closeModal(); renderPriceListPage(); toast('수정되었습니다.');
+    } catch(e) { toast('저장 실패: '+e.message); }
+  };
+  window.deletePriceItem = async id => {
+    if (!confirm('삭제하시겠습니까?')) return;
+    await deleteDoc(doc(db,'priceLists',id));
+    await loadPriceList(activeProject);
+    closeModal(); renderPriceListPage(); toast('삭제되었습니다.');
+  };
+  window.openAddPriceItem = () => {
+    openModal(`
+      <div class="modal-title">제품 추가</div>
+      <div class="modal-sub">가격표에 제품을 추가하세요.</div>
+      <div class="form-row"><label class="form-label">제품명 <span class="req">*</span></label><input type="text" id="pi_name" placeholder="제품명" autocomplete="off"></div>
+      <div class="form-row-2">
+        <div><label class="form-label">가격 (원)</label><input type="text" id="pi_price" placeholder="예: 1500000" autocomplete="off" oninput="this.value=this.value.replace(/[^0-9]/g,'')"></div>
+        <div><label class="form-label">출시여부</label>
+          <select id="pi_released">
+            <option value="출시">출시</option>
+            <option value="예정">출시예정</option>
+            <option value="단종">단종</option>
+            <option value="개발중">개발중</option>
+          </select>
+        </div>
+      </div>
+      <div class="form-row"><label class="form-label">비고</label><textarea id="pi_note" placeholder="추가 설명..." style="min-height:60px;"></textarea></div>
+      <div class="modal-footer">
+        <button class="btn" onclick="closeModal()">취소</button>
+        <button class="btn btn-primary" onclick="savePriceItem()">추가</button>
+      </div>`);
+  };
+  window.openEditPriceItem = id => {
+    const item=(priceLists[activeProject]||[]).find(x=>x.id===id); if(!item) return;
+    openModal(`
+      <div class="modal-title">제품 수정</div>
+      <div class="modal-sub">${item.name}</div>
+      <div class="form-row"><label class="form-label">제품명 <span class="req">*</span></label><input type="text" id="pi_name" value="${item.name}" autocomplete="off"></div>
+      <div class="form-row-2">
+        <div><label class="form-label">가격 (원)</label><input type="text" id="pi_price" value="${item.price||''}" placeholder="예: 1500000" autocomplete="off" oninput="this.value=this.value.replace(/[^0-9]/g,'')"></div>
+        <div><label class="form-label">출시여부</label>
+          <select id="pi_released">
+            <option value="출시"${item.released==='출시'?' selected':''}>출시</option>
+            <option value="예정"${item.released==='예정'?' selected':''}>출시예정</option>
+            <option value="단종"${item.released==='단종'?' selected':''}>단종</option>
+            <option value="개발중"${item.released==='개발중'?' selected':''}>개발중</option>
+          </select>
+        </div>
+      </div>
+      <div class="form-row"><label class="form-label">비고</label><textarea id="pi_note" style="min-height:60px;">${item.note||''}</textarea></div>
+      <div class="modal-footer">
+        <button class="btn btn-danger" onclick="deletePriceItem('${id}')">삭제</button>
+        <button class="btn" onclick="closeModal()">취소</button>
+        <button class="btn btn-primary" onclick="updatePriceItem('${id}')">저장</button>
+      </div>`);
+  };
+
+  // ── Notices ───────────────────────────────
+  window.saveNotice = async () => {
+    const title=$('nt_title').value.trim(), body=$('nt_body').value.trim(), pid=$('nt_project').value;
+    if (!title) { toast('제목을 입력하세요.'); return; }
+    if (!body)  { toast('내용을 입력하세요.'); return; }
+    const proj=projects.find(p=>p.id===pid);
+    try {
+      await addDoc(collection(db,'notices'),{
+        title, body, projectId:pid, projectName:proj?proj.name:'',
+        authorName:currentUser.displayName||currentUser.email,
+        authorId:currentUser.uid, createdAt:serverTimestamp()
+      });
+      closeModal(); toast('공지사항이 등록되었습니다.');
+    } catch(e) { toast('저장 실패: '+e.message); }
+  };
+  window.deleteNotice = async id => {
+    if (!confirm('삭제하시겠습니까?')) return;
+    await deleteDoc(doc(db,'notices',id));
+    toast('삭제되었습니다.');
+  };
+  window.openAddNotice = () => {
+    openModal(`
+      <div class="modal-title">공지사항 작성</div>
+      <div class="modal-sub">모든 팀원에게 공유할 내용을 작성하세요.</div>
+      <div class="form-row"><label class="form-label">말머리 (전시회)</label>
+        <select id="nt_project">
+          <option value="">전시회 선택 안함</option>
+          ${projects.map(p=>`<option value="${p.id}">${p.name}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-row"><label class="form-label">제목 <span class="req">*</span></label><input type="text" id="nt_title" placeholder="공지 제목" autocomplete="off"></div>
+      <div class="form-row"><label class="form-label">내용 <span class="req">*</span></label><textarea id="nt_body" placeholder="공지 내용을 입력하세요..." style="min-height:120px;"></textarea></div>
+      <div class="modal-footer">
+        <button class="btn" onclick="closeModal()">취소</button>
+        <button class="btn btn-primary" onclick="saveNotice()">등록</button>
+      </div>`);
+  };
+  window.openNoticeDetail = id => {
+    const n=notices.find(x=>x.id===id); if(!n) return;
+    const isOwner=n.authorId===currentUser?.uid||isAdmin();
+    openModal(`
+      <div style="margin-bottom:16px;">
+        ${n.projectName?`<span class="notice-tag">[${n.projectName}]</span>`:''}
+        <div style="font-size:18px;font-weight:600;margin-top:6px;">${n.title}</div>
+        <div style="font-size:12px;color:#999;margin-top:4px;">${n.authorName} · ${fmtDT(n.createdAt)}</div>
+      </div>
+      <div style="font-size:14px;line-height:1.8;white-space:pre-wrap;border-top:1px solid rgba(0,0,0,0.08);padding-top:16px;">${n.body}</div>
+      <div class="modal-footer">
+        ${isOwner?`<button class="btn btn-danger" onclick="deleteNotice('${id}');closeModal();">삭제</button>`:''}
+        <button class="btn" onclick="closeModal()">닫기</button>
+      </div>`);
   };
 
   // ── Render ────────────────────────────────
@@ -367,52 +470,37 @@
     }
     if (isMobile()) {
       $('customerTable').innerHTML=cs.map(c=>{
-        const cl=col(c.name);
-        const isMe=c.createdBy===currentUser?.uid;
-        const avatarHtml=c.cardImage
-          ?`<img src="${c.cardImage}" style="width:36px;height:36px;border-radius:50%;object-fit:cover;flex-shrink:0;">`
-          :`<div class="cust-avatar" style="width:36px;height:36px;font-size:12px;background:${cl.bg};color:${cl.txt};">${ini(c.name)}</div>`;
+        const cl=col(c.name); const isMe=c.createdBy===currentUser?.uid;
+        const avatar=c.cardImage?`<img src="${c.cardImage}" style="width:36px;height:36px;border-radius:50%;object-fit:cover;flex-shrink:0;">`:`<div class="cust-avatar" style="width:36px;height:36px;font-size:12px;background:${cl.bg};color:${cl.txt};">${ini(c.name)}</div>`;
         return `<div class="cust-card${selectedCust===c.id?' selected':''}" onclick="selectCustomer('${c.id}')">
-          <div style="display:flex;align-items:center;gap:10px;">
-            ${avatarHtml}
-            <div style="flex:1;min-width:0;">
-              <div style="font-weight:600;font-size:14px;">${c.name}</div>
-              <div style="font-size:12px;color:#555;margin-top:1px;">${c.org}</div>
-            </div>
-            <div style="text-align:right;flex-shrink:0;">
-              <span class="region-badge">${c.region||''}</span>
-              <div class="memo-count" style="margin-top:4px;">메모 ${(c.memos||[]).length}</div>
-            </div>
+          <div style="display:flex;align-items:center;gap:10px;">${avatar}
+            <div style="flex:1;min-width:0;"><div style="font-weight:600;font-size:14px;">${c.name}</div><div style="font-size:12px;color:#555;">${c.org}</div></div>
+            <div style="text-align:right;"><span class="region-badge">${c.region||''}</span><div class="memo-count" style="margin-top:4px;">메모 ${(c.memos||[]).length}</div></div>
           </div>
-          <div style="display:flex;gap:12px;margin-top:8px;font-size:11px;color:#999;border-top:1px solid rgba(0,0,0,0.06);padding-top:8px;">
-            <span>상담일 ${c.date||'—'}</span>
-            <span>등록 ${fmtDT(c.createdAt)}</span>
+          <div style="display:flex;gap:10px;margin-top:8px;font-size:11px;color:#999;border-top:1px solid rgba(0,0,0,0.06);padding-top:8px;">
+            <span>${c.date||'—'}</span><span>${fmtDT(c.createdAt)}</span>
             <span>${isMe?'<span style="color:#1D9E75;font-weight:600;">나</span>':c.authorName||'팀원'}</span>
-            ${c.cardImage?'<span style="color:#1D9E75;">📇 명함</span>':''}
+            ${c.cardImage?'<span style="color:#1D9E75;">📇</span>':''}
           </div>
         </div>`;
       }).join('');
     } else {
-      const rows=cs.map((c,i)=>{
-        const cl=col(c.name);
-        const isMe=c.createdBy===currentUser?.uid;
-        const avatarHtml=c.cardImage
-          ?`<img src="${c.cardImage}" style="width:26px;height:26px;border-radius:50%;object-fit:cover;flex-shrink:0;">`
-          :`<div class="cust-avatar" style="background:${cl.bg};color:${cl.txt};">${ini(c.name)}</div>`;
-        return `<div class="table-row${selectedCust===c.id?' selected':''}" onclick="selectCustomer('${c.id}')">
-          <div style="font-size:11px;color:#999;text-align:center;">${i+1}</div>
-          <div class="cust-name-cell">${avatarHtml}<span class="cust-name">${c.name}</span></div>
-          <div class="cust-org">${c.org}</div>
-          <div><span class="region-badge">${c.region||''}</span></div>
-          <div class="date-text">${c.date||'—'}</div>
-          <div class="date-text" style="font-size:11px;">${fmtDT(c.createdAt)}</div>
-          <div class="date-text" style="font-size:11px;">${isMe?'<span style="color:#1D9E75;font-weight:600;">나</span>':c.authorName||'팀원'}</div>
-          <div>${c.cardImage?'<span style="color:#1D9E75;font-size:11px;">📇 등록</span>':'<span class="memo-count">메모 '+((c.memos||[]).length)+'</span>'}</div>
-        </div>`;
-      }).join('');
       $('customerTable').innerHTML=`
         <div class="table-head"><div></div><div>이름</div><div>소속</div><div>지역</div><div>상담일</div><div>등록시각</div><div>담당자</div><div>명함/메모</div></div>
-        ${rows}`;
+        ${cs.map((c,i)=>{
+          const cl=col(c.name); const isMe=c.createdBy===currentUser?.uid;
+          const avatar=c.cardImage?`<img src="${c.cardImage}" style="width:26px;height:26px;border-radius:50%;object-fit:cover;flex-shrink:0;">`:`<div class="cust-avatar" style="background:${cl.bg};color:${cl.txt};">${ini(c.name)}</div>`;
+          return `<div class="table-row${selectedCust===c.id?' selected':''}" onclick="selectCustomer('${c.id}')">
+            <div style="font-size:11px;color:#999;text-align:center;">${i+1}</div>
+            <div class="cust-name-cell">${avatar}<span class="cust-name">${c.name}</span></div>
+            <div class="cust-org">${c.org}</div>
+            <div><span class="region-badge">${c.region||''}</span></div>
+            <div class="date-text">${c.date||'—'}</div>
+            <div class="date-text" style="font-size:11px;">${fmtDT(c.createdAt)}</div>
+            <div class="date-text" style="font-size:11px;">${isMe?'<span style="color:#1D9E75;font-weight:600;">나</span>':c.authorName||'팀원'}</div>
+            <div>${c.cardImage?'<span style="color:#1D9E75;font-size:11px;">📇 등록</span>':'<span class="memo-count">메모 '+((c.memos||[]).length)+'</span>'}</div>
+          </div>`;
+        }).join('')}`;
     }
   }
 
@@ -422,34 +510,22 @@
   };
 
   function renderDetail(cid) {
-    const c=customers.find(x=>x.id===cid);
-    if (!c) { $('detailPanel').style.display='none'; return; }
-    const cl=col(c.name);
-    const panel=$('detailPanel');
-    panel.style.display='flex';
+    const c=customers.find(x=>x.id===cid); if(!c) { $('detailPanel').style.display='none'; return; }
+    const cl=col(c.name); const panel=$('detailPanel'); panel.style.display='flex';
     const isMe=c.createdBy===currentUser?.uid;
-    const avatarHtml=c.cardImage
-      ?`<img src="${c.cardImage}" style="width:48px;height:48px;border-radius:50%;object-fit:cover;margin-bottom:8px;">`
-      :`<div class="detail-avatar-lg" style="background:${cl.bg};color:${cl.txt};">${ini(c.name)}</div>`;
-    const cardSection=c.cardImage
-      ?`<div style="margin-bottom:12px;">
-          <div style="font-size:11px;font-weight:600;color:#999;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;">명함</div>
-          <img src="${c.cardImage}" style="width:100%;border-radius:10px;border:1px solid rgba(0,0,0,0.08);object-fit:cover;max-height:150px;">
-        </div>`
-      :'';
-    const memoHtml=(c.memos||[]).length
-      ? c.memos.map(m=>`<div class="memo-item"><div style="line-height:1.6;">${m.text}</div><div class="memo-date">${m.date||''}${m.time?' '+m.time:''} · ${m.author||''}</div></div>`).join('')
-      : `<div style="font-size:12px;color:#999;padding:4px 0;">아직 메모가 없습니다.</div>`;
+    const avatar=c.cardImage?`<img src="${c.cardImage}" style="width:48px;height:48px;border-radius:50%;object-fit:cover;margin-bottom:8px;">`:`<div class="detail-avatar-lg" style="background:${cl.bg};color:${cl.txt};">${ini(c.name)}</div>`;
+    const cardSec=c.cardImage?`<div style="margin-bottom:12px;"><div style="font-size:11px;font-weight:600;color:#999;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;">명함</div><img src="${c.cardImage}" style="width:100%;border-radius:10px;border:1px solid rgba(0,0,0,0.08);object-fit:cover;max-height:150px;"></div>`:'';
+    const memoHtml=(c.memos||[]).length?c.memos.map(m=>`<div class="memo-item"><div style="line-height:1.6;">${m.text}</div><div class="memo-date">${m.date||''}${m.time?' '+m.time:''} · ${m.author||''}</div></div>`).join(''):`<div style="font-size:12px;color:#999;padding:4px 0;">아직 메모가 없습니다.</div>`;
     panel.innerHTML=`
       <div class="detail-header">
-        <div>${avatarHtml}<div class="detail-name">${c.name}</div><div class="detail-org">${c.org}</div></div>
+        <div>${avatar}<div class="detail-name">${c.name}</div><div class="detail-org">${c.org}</div></div>
         <div style="display:flex;flex-direction:column;align-items:flex-end;gap:6px;">
           <span style="cursor:pointer;font-size:22px;color:#bbb;" onclick="closeDetail()">✕</span>
           ${isMe||isAdmin()?`<button class="btn" style="font-size:11px;padding:4px 10px;" onclick="openEditCustomer('${c.id}')">편집</button>`:''}
         </div>
       </div>
       <div class="detail-body">
-        ${cardSection}
+        ${cardSec}
         <div class="detail-meta-row"><span class="detail-meta-label">지역</span><span class="region-badge">${c.region||''}</span></div>
         <div class="detail-meta-row"><span class="detail-meta-label">상담일</span>${c.date||'—'}</div>
         <div class="detail-meta-row"><span class="detail-meta-label">담당자</span>${isMe?'나 ('+(currentUser.displayName||currentUser.email)+')':c.authorName||'팀원'}</div>
@@ -466,101 +542,94 @@
         </div>
       </div>`;
   }
-
   window.closeDetail = () => { selectedCust=null; $('detailPanel').style.display='none'; renderTable(); };
 
-  window.openModal  = html => { $('modal').innerHTML=html; $('modalOverlay').style.display='flex'; };
-  window.closeModal = () => {
-    $('modalOverlay').style.display='none';
-    closeCamera();
-    cardImageData=null;
-  };
+  // ── Price List Page ───────────────────────
+  function renderPriceListPage() {
+    const items=priceLists[activeProject]||[];
+    const p=projects.find(x=>x.id===activeProject);
+    $('topbarTitle').textContent=p?p.name+' — 가격표':'가격표';
+    $('topbarMeta').textContent='전시 제품 가격 목록';
+    $('detailPanel').style.display='none';
+    const releasedBadge = r => {
+      const map={'출시':'#1D9E75','예정':'#185FA5','단종':'#E24B4A','개발중':'#854F0B'};
+      return `<span style="font-size:11px;padding:2px 8px;border-radius:8px;background:${map[r]||'#999'}20;color:${map[r]||'#999'};font-weight:600;">${r||'—'}</span>`;
+    };
+    $('viewPrice').innerHTML=`
+      <div class="section-header" style="margin-bottom:14px;">
+        <div class="section-title">전시 제품 가격표 (${items.length}개)</div>
+        ${isAdmin()?`<button class="btn btn-primary" onclick="openAddPriceItem()">+ 제품 추가</button>`:''}
+      </div>
+      ${items.length===0?'<div class="empty-state">등록된 제품이 없습니다.</div>':
+      `<div style="background:#fff;border:1px solid rgba(0,0,0,0.08);border-radius:14px;overflow:hidden;">
+        <div style="display:grid;grid-template-columns:2fr 1.2fr 0.8fr 1.5fr${isAdmin()?' 60px':''};background:#F4F3EF;padding:10px 16px;font-size:11px;font-weight:600;color:#999;text-transform:uppercase;letter-spacing:0.5px;gap:8px;">
+          <div>제품명</div><div>가격</div><div>출시여부</div><div>비고</div>${isAdmin()?'<div></div>':''}
+        </div>
+        ${items.map(item=>`
+          <div style="display:grid;grid-template-columns:2fr 1.2fr 0.8fr 1.5fr${isAdmin()?' 60px':''};padding:12px 16px;border-top:1px solid rgba(0,0,0,0.06);align-items:center;gap:8px;font-size:13px;">
+            <div style="font-weight:600;">${item.name}</div>
+            <div style="color:#1D9E75;font-weight:600;">${fmtPrice(item.price)}</div>
+            <div>${releasedBadge(item.released)}</div>
+            <div style="color:#555;font-size:12px;">${item.note||'—'}</div>
+            ${isAdmin()?`<div><button class="btn" style="font-size:11px;padding:4px 8px;" onclick="openEditPriceItem('${item.id}')">편집</button></div>`:''}
+          </div>`).join('')}
+      </div>`}`;
+  }
 
-  window.openAddCustomer = () => {
-    if (!projects.length) { toast('먼저 전시회를 등록해주세요.'); return; }
-    cardImageData = null;
-    openModal(`
-      <div class="modal-title">신규 고객 등록</div>
-      <div class="modal-sub">고객 정보를 입력하고 저장하세요.</div>
-      <div class="form-row"><label class="form-label">전시회 선택 <span class="req">*</span></label>
-        <select id="fc_project">${projects.map(p=>`<option value="${p.id}"${p.id===activeProject?' selected':''}>${p.name}</option>`).join('')}</select></div>
-      <div class="form-row-2">
-        <div><label class="form-label">고객명 <span class="req">*</span></label><input type="text" id="fc_name" placeholder="홍길동" autocomplete="off"></div>
-        <div><label class="form-label">소속 <span class="req">*</span></label><input type="text" id="fc_org" placeholder="회사명" autocomplete="off"></div>
+  // ── Notices Page ──────────────────────────
+  function renderNoticesPage() {
+    $('topbarTitle').textContent='공지사항';
+    $('topbarMeta').textContent='팀 공지 및 정보 공유';
+    $('detailPanel').style.display='none';
+    $('viewNotices').innerHTML=`
+      <div class="section-header" style="margin-bottom:14px;">
+        <div class="section-title">공지사항 (${notices.length})</div>
+        <button class="btn btn-primary" onclick="openAddNotice()">+ 공지 작성</button>
       </div>
-      <div class="form-row-2">
-        <div><label class="form-label">지역</label>
-          <select id="fc_region">${REGIONS.map(r=>`<option>${r}</option>`).join('')}</select></div>
-        <div><label class="form-label">상담일</label><input type="date" id="fc_date" value="${today()}"></div>
-      </div>
-      <div class="form-row">
-        <label class="form-label">명함 사진</label>
-        <div id="cardPreview">${cardEmptyHtml()}</div>
-      </div>
-      <div class="form-row"><label class="form-label">첫 상담 메모 (선택)</label>
-        <textarea id="fc_memo" placeholder="상담 내용을 입력하세요..."></textarea></div>
-      <div class="modal-footer">
-        <button class="btn" onclick="closeModal()">취소</button>
-        <button class="btn btn-primary" id="saveNewBtn" onclick="saveNewCustomer()">저장</button>
-      </div>`);
-  };
+      ${notices.length===0?'<div class="empty-state">등록된 공지사항이 없습니다.</div>':
+      notices.map(n=>`
+        <div class="notice-item" onclick="openNoticeDetail('${n.id}')">
+          <div style="display:flex;align-items:flex-start;gap:10px;">
+            ${n.projectName?`<span class="notice-tag">[${n.projectName}]</span>`:'<span class="notice-tag" style="background:#F4F3EF;color:#999;">[일반]</span>'}
+            <div style="flex:1;min-width:0;">
+              <div style="font-weight:600;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${n.title}</div>
+              <div style="font-size:12px;color:#999;margin-top:3px;">${n.authorName} · ${fmtDT(n.createdAt)}</div>
+            </div>
+          </div>
+          <div style="font-size:13px;color:#555;margin-top:8px;line-height:1.5;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;">${n.body}</div>
+        </div>`).join('')}`;
+  }
 
-  window.openEditCustomer = cid => {
-    const c=customers.find(x=>x.id===cid); if(!c) return;
-    cardImageData = c.cardImage||null;
-    openModal(`
-      <div class="modal-title">고객 정보 편집</div>
-      <div class="modal-sub">${c.name} · ${c.org}</div>
-      <div class="form-row-2">
-        <div><label class="form-label">고객명 <span class="req">*</span></label><input type="text" id="ec_name" value="${c.name}" autocomplete="off"></div>
-        <div><label class="form-label">소속 <span class="req">*</span></label><input type="text" id="ec_org" value="${c.org}" autocomplete="off"></div>
+  // ── Card Gallery Page ─────────────────────
+  function renderCardsPage() {
+    if (!isAdmin()) return;
+    $('topbarTitle').textContent='명함 갤러리';
+    $('topbarMeta').textContent='등록된 명함 사진 모아보기';
+    $('detailPanel').style.display='none';
+    const withCards=customers.filter(c=>c.cardImage);
+    $('viewCards').innerHTML=`
+      <div class="section-header" style="margin-bottom:14px;">
+        <div class="section-title">명함 갤러리 (${withCards.length}장)</div>
       </div>
-      <div class="form-row-2">
-        <div><label class="form-label">지역</label>
-          <select id="ec_region">${REGIONS.map(r=>`<option${r===c.region?' selected':''}>${r}</option>`).join('')}</select></div>
-        <div><label class="form-label">상담일</label><input type="date" id="ec_date" value="${c.date||today()}"></div>
-      </div>
-      <div class="form-row">
-        <label class="form-label">명함 사진</label>
-        <div id="cardPreview">${c.cardImage
-          ? `<div style="position:relative;display:inline-block;width:100%;">
-               <img src="${c.cardImage}" style="width:100%;max-height:160px;object-fit:cover;border-radius:10px;display:block;">
-               <button onclick="removeCardImage()" style="position:absolute;top:6px;right:6px;background:rgba(0,0,0,0.55);color:#fff;border:none;border-radius:50%;width:26px;height:26px;font-size:14px;cursor:pointer;display:flex;align-items:center;justify-content:center;">✕</button>
-             </div>`
-          : cardEmptyHtml()}</div>
-      </div>
-      <div class="modal-footer">
-        <button class="btn btn-danger" onclick="deleteCustomer('${c.id}')">삭제</button>
-        <button class="btn" onclick="closeModal()">취소</button>
-        <button class="btn btn-primary" id="saveEditBtn" onclick="saveEditCustomer('${c.id}')">저장</button>
-      </div>`);
-  };
+      ${withCards.length===0?'<div class="empty-state">등록된 명함이 없습니다.</div>':
+      `<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px;">
+        ${withCards.map(c=>{
+          const cl=col(c.name);
+          return `<div class="card-gallery-item" onclick="selectCustomer('${c.id}');setView('customers');">
+            <img src="${c.cardImage}" style="width:100%;height:130px;object-fit:cover;border-radius:10px 10px 0 0;display:block;">
+            <div style="padding:10px 12px;">
+              <div style="display:flex;align-items:center;gap:7px;margin-bottom:5px;">
+                <div style="width:22px;height:22px;border-radius:50%;background:${cl.bg};color:${cl.txt};display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:600;flex-shrink:0;">${ini(c.name)}</div>
+                <div style="min-width:0;"><div style="font-weight:600;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${c.name}</div><div style="font-size:11px;color:#555;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${c.org}</div></div>
+              </div>
+              <div style="font-size:10px;color:#999;">${c.authorName||''} · ${c.date||''}</div>
+            </div>
+          </div>`;
+        }).join('')}
+      </div>`}`;
+  }
 
-  window.openAddProject = () => openModal(`
-    <div class="modal-title">전시회 등록</div>
-    <div class="modal-sub">새로운 전시회 프로젝트를 등록하세요.</div>
-    <div class="form-row"><label class="form-label">전시회명 <span class="req">*</span></label>
-      <input type="text" id="fp_name" placeholder="2025 스마트팩토리 엑스포" autocomplete="off"></div>
-    <div class="form-row"><label class="form-label">개최 장소</label>
-      <input type="text" id="fp_loc" placeholder="서울 COEX A홀" autocomplete="off"></div>
-    <div class="form-row-2">
-      <div><label class="form-label">시작일</label><input type="date" id="fp_date_from" value="${today()}"></div>
-      <div><label class="form-label">종료일</label><input type="date" id="fp_date_to" value="${today()}"></div>
-    </div>
-    <div class="modal-footer">
-      <button class="btn" onclick="closeModal()">취소</button>
-      <button class="btn btn-primary" onclick="saveProject()">등록</button>
-    </div>`);
-
-  window.setView = v => {
-    $('viewCustomers').style.display=v==='customers'?'block':'none';
-    $('viewProjects').style.display =v==='projects' ?'block':'none';
-    $('nav0').classList.toggle('active',v==='customers');
-    $('nav1').classList.toggle('active',v==='projects');
-    if (v==='projects') renderProjectsPage();
-    else { renderStats(); renderTable(); }
-  };
-
+  // ── Projects Page ─────────────────────────
   function renderProjectsPage() {
     $('topbarTitle').textContent='전시회 관리';
     $('topbarMeta').textContent='프로젝트 등록 및 관리';
@@ -584,6 +653,82 @@
         </div>`;
       }).join('')||'<div class="empty-state">등록된 전시회가 없습니다.</div>'}`;
   }
+
+  // ── View switching ────────────────────────
+  window.setView = v => {
+    ['viewCustomers','viewProjects','viewCards','viewPrice','viewNotices'].forEach(id=>$(id).style.display='none');
+    $('view'+v.charAt(0).toUpperCase()+v.slice(1)).style.display='block';
+    ['nav0','nav1','nav2','nav3','nav4'].forEach((id,i)=>$(id)&&$(id).classList.toggle('active',
+      (v==='customers'&&i===0)||(v==='projects'&&i===1)||(v==='cards'&&i===2)||(v==='price'&&i===3)||(v==='notices'&&i===4)));
+    if (v==='projects')  renderProjectsPage();
+    else if (v==='cards')    renderCardsPage();
+    else if (v==='price')    renderPriceListPage();
+    else if (v==='notices')  renderNoticesPage();
+    else { renderStats(); renderTable(); }
+  };
+
+  window.openModal  = html => { $('modal').innerHTML=html; $('modalOverlay').style.display='flex'; };
+  window.closeModal = () => { $('modalOverlay').style.display='none'; closeCamera(); cardImageData=null; };
+
+  window.openAddCustomer = () => {
+    if (!projects.length) { toast('먼저 전시회를 등록해주세요.'); return; }
+    cardImageData=null;
+    openModal(`
+      <div class="modal-title">신규 고객 등록</div>
+      <div class="modal-sub">고객 정보를 입력하고 저장하세요.</div>
+      <div class="form-row"><label class="form-label">전시회 선택 <span class="req">*</span></label>
+        <select id="fc_project">${projects.map(p=>`<option value="${p.id}"${p.id===activeProject?' selected':''}>${p.name}</option>`).join('')}</select></div>
+      <div class="form-row-2">
+        <div><label class="form-label">고객명 <span class="req">*</span></label><input type="text" id="fc_name" placeholder="홍길동" autocomplete="off"></div>
+        <div><label class="form-label">소속 <span class="req">*</span></label><input type="text" id="fc_org" placeholder="회사명" autocomplete="off"></div>
+      </div>
+      <div class="form-row-2">
+        <div><label class="form-label">지역</label><select id="fc_region">${REGIONS.map(r=>`<option>${r}</option>`).join('')}</select></div>
+        <div><label class="form-label">상담일</label><input type="date" id="fc_date" value="${today()}"></div>
+      </div>
+      <div class="form-row"><label class="form-label">명함 사진</label><div id="cardPreview">${cardEmptyHtml()}</div></div>
+      <div class="form-row"><label class="form-label">첫 상담 메모 (선택)</label><textarea id="fc_memo" placeholder="상담 내용을 입력하세요..."></textarea></div>
+      <div class="modal-footer">
+        <button class="btn" onclick="closeModal()">취소</button>
+        <button class="btn btn-primary" id="saveNewBtn" onclick="saveNewCustomer()">저장</button>
+      </div>`);
+  };
+  window.openEditCustomer = cid => {
+    const c=customers.find(x=>x.id===cid); if(!c) return;
+    cardImageData=c.cardImage||null;
+    openModal(`
+      <div class="modal-title">고객 정보 편집</div>
+      <div class="modal-sub">${c.name} · ${c.org}</div>
+      <div class="form-row-2">
+        <div><label class="form-label">고객명 <span class="req">*</span></label><input type="text" id="ec_name" value="${c.name}" autocomplete="off"></div>
+        <div><label class="form-label">소속 <span class="req">*</span></label><input type="text" id="ec_org" value="${c.org}" autocomplete="off"></div>
+      </div>
+      <div class="form-row-2">
+        <div><label class="form-label">지역</label><select id="ec_region">${REGIONS.map(r=>`<option${r===c.region?' selected':''}>${r}</option>`).join('')}</select></div>
+        <div><label class="form-label">상담일</label><input type="date" id="ec_date" value="${c.date||today()}"></div>
+      </div>
+      <div class="form-row"><label class="form-label">명함 사진</label>
+        <div id="cardPreview">${c.cardImage?`<div style="position:relative;display:inline-block;width:100%;"><img src="${c.cardImage}" style="width:100%;max-height:160px;object-fit:cover;border-radius:10px;display:block;"><button onclick="removeCardImage()" style="position:absolute;top:6px;right:6px;background:rgba(0,0,0,0.55);color:#fff;border:none;border-radius:50%;width:26px;height:26px;font-size:14px;cursor:pointer;">✕</button></div>`:cardEmptyHtml()}</div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-danger" onclick="deleteCustomer('${c.id}')">삭제</button>
+        <button class="btn" onclick="closeModal()">취소</button>
+        <button class="btn btn-primary" id="saveEditBtn" onclick="saveEditCustomer('${c.id}')">저장</button>
+      </div>`);
+  };
+  window.openAddProject = () => openModal(`
+    <div class="modal-title">전시회 등록</div>
+    <div class="modal-sub">새로운 전시회 프로젝트를 등록하세요.</div>
+    <div class="form-row"><label class="form-label">전시회명 <span class="req">*</span></label><input type="text" id="fp_name" placeholder="2025 스마트팩토리 엑스포" autocomplete="off"></div>
+    <div class="form-row"><label class="form-label">개최 장소</label><input type="text" id="fp_loc" placeholder="서울 COEX A홀" autocomplete="off"></div>
+    <div class="form-row-2">
+      <div><label class="form-label">시작일</label><input type="date" id="fp_date_from" value="${today()}"></div>
+      <div><label class="form-label">종료일</label><input type="date" id="fp_date_to" value="${today()}"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn" onclick="closeModal()">취소</button>
+      <button class="btn btn-primary" onclick="saveProject()">등록</button>
+    </div>`);
 
   window.addEventListener('resize', renderTable);
   document.addEventListener('keydown', e => {
@@ -650,7 +795,6 @@ body{background:var(--bg);color:var(--c-text);min-height:100vh;}
 .search-bar{display:flex;align-items:center;gap:6px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:6px 10px;}
 .search-bar input{border:none;background:transparent;outline:none;font-size:13px;color:var(--c-text);font-family:inherit;width:150px;}
 .content{flex:1;overflow-y:auto;padding:16px;}
-
 .stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px;}
 .stat-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:12px 14px;}
 .stat-label{font-size:11px;color:var(--c-muted);margin-bottom:3px;}
@@ -672,7 +816,6 @@ body{background:var(--bg);color:var(--c-text);min-height:100vh;}
 .region-badge{display:inline-block;font-size:11px;padding:2px 7px;border-radius:8px;background:var(--bg);color:var(--c-muted);white-space:nowrap;}
 .date-text{font-size:12px;color:var(--c-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .memo-count{font-size:11px;padding:2px 7px;border-radius:8px;background:var(--bg);color:var(--c-muted);white-space:nowrap;}
-
 .cust-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:14px;margin-bottom:8px;cursor:pointer;transition:background 0.12s;}
 .cust-card:hover{background:var(--bg);}
 .cust-card.selected{background:var(--green-l);border-color:var(--green-m);}
@@ -700,10 +843,8 @@ textarea{resize:vertical;min-height:80px;line-height:1.5;}
 .modal-sub{font-size:12px;color:var(--c-muted);margin-bottom:20px;}
 .modal-footer{display:flex;justify-content:flex-end;gap:8px;margin-top:20px;border-top:1px solid var(--border);padding-top:16px;}
 
-/* Camera */
 #cameraWrap{position:fixed;inset:0;background:rgba(0,0,0,0.92);display:none;flex-direction:column;align-items:center;justify-content:center;z-index:300;gap:16px;padding:20px;}
 #cameraVideo{width:100%;max-width:480px;border-radius:14px;border:2px solid var(--green);background:#000;}
-.camera-actions{display:flex;gap:12px;}
 .cam-btn{padding:12px 24px;border-radius:var(--radius);font-size:14px;cursor:pointer;border:none;font-family:inherit;font-weight:600;}
 .cam-shoot{background:var(--green);color:#fff;}
 .cam-cancel{background:rgba(255,255,255,0.15);color:#fff;}
@@ -720,8 +861,18 @@ textarea{resize:vertical;min-height:80px;line-height:1.5;}
 .memo-section-title{font-size:11px;font-weight:600;color:var(--c-muted);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:10px;}
 .memo-item{padding:10px 12px;border-radius:var(--radius);background:var(--bg);margin-bottom:8px;font-size:13px;}
 .memo-date{font-size:10px;color:var(--c-muted);margin-top:5px;}
+
 .project-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:14px 16px;margin-bottom:10px;display:flex;align-items:center;justify-content:space-between;transition:background 0.15s;}
 .project-card:hover{background:var(--bg);}
+
+/* Notice */
+.notice-item{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:14px 16px;margin-bottom:10px;cursor:pointer;transition:background 0.12s;}
+.notice-item:hover{background:var(--bg);}
+.notice-tag{display:inline-block;font-size:11px;font-weight:600;padding:2px 8px;border-radius:6px;background:var(--green-l);color:var(--green-d);white-space:nowrap;flex-shrink:0;}
+
+/* Card gallery */
+.card-gallery-item{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);overflow:hidden;cursor:pointer;transition:transform 0.15s,box-shadow 0.15s;}
+.card-gallery-item:hover{transform:translateY(-2px);box-shadow:0 8px 24px rgba(0,0,0,0.1);}
 
 #toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#1a1a1a;color:#fff;padding:10px 20px;border-radius:var(--radius);font-size:13px;z-index:999;opacity:0;transition:opacity 0.25s;pointer-events:none;white-space:nowrap;}
 #toast.show{opacity:1;}
@@ -741,7 +892,6 @@ textarea{resize:vertical;min-height:80px;line-height:1.5;}
   .stats-row{gap:12px;margin-bottom:20px;}
   .stat-value{font-size:24px;}
 }
-
 @media(max-width:768px){
   .sidebar{position:fixed;top:0;left:0;height:100%;transform:translateX(-100%);box-shadow:4px 0 20px rgba(0,0,0,0.15);}
   .sidebar.open{transform:translateX(0);}
@@ -794,6 +944,9 @@ textarea{resize:vertical;min-height:80px;line-height:1.5;}
       <div class="sidebar-label">메뉴</div>
       <div class="nav-item active" id="nav0" onclick="setView('customers')"><span style="font-size:14px;">👥</span>고객 목록</div>
       <div class="nav-item" id="nav1" onclick="setView('projects')"><span style="font-size:14px;">📋</span>전시회 관리</div>
+      <div class="nav-item" id="nav2" style="display:none;" onclick="setView('cards')"><span style="font-size:14px;">📇</span>명함 갤러리</div>
+      <div class="nav-item" id="nav3" onclick="setView('price')"><span style="font-size:14px;">💰</span>가격표</div>
+      <div class="nav-item" id="nav4" onclick="setView('notices')"><span style="font-size:14px;">📢</span>공지사항</div>
     </div>
     <div class="sidebar-section" style="flex:1;overflow:hidden;display:flex;flex-direction:column;">
       <div class="sidebar-label">전시회</div>
@@ -837,31 +990,27 @@ textarea{resize:vertical;min-height:80px;line-height:1.5;}
     <div class="content">
       <div id="viewCustomers">
         <div class="stats-row" id="statsRow"></div>
-        <div class="section-header">
-          <div class="section-title" id="sectionTitle">고객 목록</div>
-        </div>
-        <div class="customer-table" id="customerTable">
-          <div class="empty-state">전시회를 선택하면 고객 목록이 표시됩니다.</div>
-        </div>
+        <div class="section-header"><div class="section-title" id="sectionTitle">고객 목록</div></div>
+        <div class="customer-table" id="customerTable"><div class="empty-state">전시회를 선택하면 고객 목록이 표시됩니다.</div></div>
       </div>
       <div id="viewProjects" style="display:none;"></div>
+      <div id="viewCards"    style="display:none;"></div>
+      <div id="viewPrice"    style="display:none;"></div>
+      <div id="viewNotices"  style="display:none;"></div>
     </div>
   </div>
   <div id="detailPanel" style="display:none;"></div>
 </div>
 
-<!-- Camera -->
 <div id="cameraWrap">
   <video id="cameraVideo" autoplay playsinline muted></video>
   <canvas id="cameraCanvas" style="display:none;"></canvas>
   <div style="font-size:13px;color:rgba(255,255,255,0.6);">명함에 카메라를 맞추세요</div>
-  <div class="camera-actions">
+  <div style="display:flex;gap:12px;">
     <button class="cam-btn cam-shoot" onclick="capturePhoto()">📸 촬영</button>
     <button class="cam-btn cam-cancel" onclick="closeCamera()">취소</button>
   </div>
 </div>
-
-<!-- Gallery input -->
 <input type="file" id="galleryInput" accept="image/*" style="display:none;" onchange="onGallerySelected(this)">
 
 <div class="modal-overlay" id="modalOverlay" style="display:none;" onclick="if(event.target===this)closeModal()">
