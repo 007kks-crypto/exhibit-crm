@@ -10,8 +10,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Pretendard:wght@400;500;600&display=swap" rel="stylesheet">
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
-  import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile }
-    from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+  import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile, updatePassword, reauthenticateWithCredential, EmailAuthProvider } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
   import { getFirestore, collection, doc, addDoc, updateDoc, deleteDoc, setDoc, getDoc, getDocs, onSnapshot, query, where, serverTimestamp, orderBy }
     from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 
@@ -223,6 +222,97 @@
     } finally {
       if (btn) { btn.disabled=false; btn.textContent='📥 엑셀 다운로드'; }
     }
+  };
+
+  // ── 마이페이지 ───────────────────────────
+  window.openMyPage = () => {
+    openModal(`
+      <div class="modal-title">👤 내 정보</div>
+      <div class="modal-sub">계정 정보를 확인하고 수정할 수 있습니다.</div>
+
+      <div style="background:#F4F3EF;border-radius:12px;padding:16px;margin-bottom:20px;">
+        <div style="display:flex;align-items:center;gap:12px;">
+          <div style="width:48px;height:48px;border-radius:50%;background:#E1F5EE;color:#0F6E56;display:flex;align-items:center;justify-content:center;font-size:16px;font-weight:600;flex-shrink:0;">${ini(currentUser.displayName||currentUser.email)}</div>
+          <div>
+            <div style="font-weight:600;font-size:15px;">${currentUser.displayName||'—'}</div>
+            <div style="font-size:13px;color:#555;margin-top:2px;">${currentUser.email}</div>
+            ${isAdmin()?'<div style="font-size:10px;font-weight:600;color:#0F6E56;background:#E1F5EE;padding:2px 8px;border-radius:8px;display:inline-block;margin-top:4px;">관리자</div>':''}
+          </div>
+        </div>
+      </div>
+
+      <div style="border:1px solid rgba(0,0,0,0.08);border-radius:12px;overflow:hidden;margin-bottom:20px;">
+        <div style="padding:14px 16px;border-bottom:1px solid rgba(0,0,0,0.06);">
+          <div style="font-size:12px;font-weight:600;color:#999;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:10px;">이름 변경</div>
+          <div style="display:flex;gap:8px;">
+            <input type="text" id="mp_name" value="${currentUser.displayName||''}" placeholder="이름 입력" style="flex:1;">
+            <button class="btn btn-primary" style="font-size:12px;padding:6px 12px;white-space:nowrap;" onclick="updateName()">변경</button>
+          </div>
+        </div>
+        <div style="padding:14px 16px;">
+          <div style="font-size:12px;font-weight:600;color:#999;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:10px;">비밀번호 변경</div>
+          <div class="form-row" style="margin-bottom:10px;">
+            <label class="form-label">현재 비밀번호</label>
+            <input type="text" id="mp_cur_pw" placeholder="현재 비밀번호" style="-webkit-text-security:disc;">
+          </div>
+          <div class="form-row" style="margin-bottom:10px;">
+            <label class="form-label">새 비밀번호</label>
+            <input type="text" id="mp_new_pw" placeholder="새 비밀번호 (6자 이상)" style="-webkit-text-security:disc;">
+          </div>
+          <div class="form-row" style="margin-bottom:14px;">
+            <label class="form-label">새 비밀번호 확인</label>
+            <input type="text" id="mp_new_pw2" placeholder="새 비밀번호 재입력" style="-webkit-text-security:disc;">
+          </div>
+          <button class="btn btn-primary" style="width:100%;justify-content:center;padding:10px;" onclick="changePassword()">비밀번호 변경</button>
+        </div>
+      </div>
+
+      <div style="border:1px solid #FCEBEB;border-radius:12px;padding:14px 16px;">
+        <div style="font-size:12px;font-weight:600;color:#E24B4A;margin-bottom:8px;">위험 구역</div>
+        <button class="btn btn-danger" style="width:100%;justify-content:center;padding:10px;" onclick="confirmLogout()">🚪 로그아웃</button>
+      </div>
+
+      <div class="modal-footer">
+        <button class="btn" onclick="closeModal()">닫기</button>
+      </div>`);
+  };
+
+  window.updateName = async () => {
+    const name = $('mp_name').value.trim();
+    if (!name) { toast('이름을 입력하세요.'); return; }
+    try {
+      await updateProfile(currentUser, { displayName: name });
+      // Firestore users 컬렉션도 업데이트
+      await updateDoc(doc(db,'users',currentUser.uid), { name });
+      $('userDisplayName').textContent = name;
+      $('userAvatar').textContent = ini(name);
+      toast('이름이 변경되었습니다.');
+    } catch(e) { toast('변경 실패: '+e.message); }
+  };
+
+  window.changePassword = async () => {
+    const curPw  = $('mp_cur_pw').value.trim();
+    const newPw  = $('mp_new_pw').value.trim();
+    const newPw2 = $('mp_new_pw2').value.trim();
+    if (!curPw)  { toast('현재 비밀번호를 입력하세요.'); return; }
+    if (!newPw)  { toast('새 비밀번호를 입력하세요.'); return; }
+    if (newPw.length < 6) { toast('새 비밀번호는 6자 이상이어야 합니다.'); return; }
+    if (newPw !== newPw2) { toast('새 비밀번호가 일치하지 않습니다.'); return; }
+    try {
+      // 재인증 후 비밀번호 변경
+      const credential = EmailAuthProvider.credential(currentUser.email, curPw);
+      await reauthenticateWithCredential(currentUser, credential);
+      await updatePassword(currentUser, newPw);
+      closeModal();
+      toast('비밀번호가 변경되었습니다.');
+    } catch(e) {
+      if (e.code==='auth/wrong-password'||e.code==='auth/invalid-credential') toast('현재 비밀번호가 올바르지 않습니다.');
+      else toast('변경 실패: '+e.message);
+    }
+  };
+
+  window.confirmLogout = () => {
+    if (confirm('로그아웃 하시겠습니까?')) { closeModal(); doLogout(); }
   };
 
   window.doLogout    = () => signOut(auth);
@@ -1351,7 +1441,19 @@
   window.addEventListener('popstate', e => {
     if (!currentUser) return;
     const state = e.state;
-    if (!state) { setView('dashboard', true); return; }
+    // 히스토리 스택이 비었으면 (앱 밖으로 나가려는 경우) 확인
+    if (!state) {
+      const leave = confirm('ExhibitCRM을 종료하시겠습니까?');
+      if (leave) {
+        // 로그아웃 후 종료
+        signOut(auth);
+      } else {
+        // 취소 — 현재 뷰로 다시 push
+        const cur = window.location.hash.replace('#','').split('/')[0] || 'dashboard';
+        history.pushState({view:cur, projectId:activeProject}, '', window.location.hash||'#dashboard');
+      }
+      return;
+    }
     if (state.projectId && state.projectId !== activeProject) {
       activeProject = state.projectId;
       customers = allCustomers.filter(c => c.projectId === activeProject);
@@ -1368,6 +1470,14 @@
       selectedCust  = null;
     }
     setView(state.view, true);
+  });
+
+  // 브라우저 탭 닫기/새로고침 시 확인
+  window.addEventListener('beforeunload', e => {
+    if (currentUser) {
+      e.preventDefault();
+      e.returnValue = '';
+    }
   });
 
   window.openModal  = html => { $('modal').innerHTML=html; $('modalOverlay').style.display='flex'; };
@@ -1683,12 +1793,16 @@ textarea{resize:vertical;min-height:80px;line-height:1.5;}
       <div class="project-list" id="projectList"><div style="font-size:12px;color:#999;padding:6px 8px;">불러오는 중...</div></div>
     </div>
     <div class="sidebar-bottom">
-      <div class="user-chip">
+      <div class="user-chip" onclick="openMyPage()" style="cursor:pointer;">
         <div class="s-avatar" id="userAvatar">??</div>
         <div style="flex:1;min-width:0;">
           <div style="font-size:12px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" id="userDisplayName">—</div>
           <div id="adminBadge" style="display:none;font-size:10px;font-weight:600;color:#0F6E56;background:#E1F5EE;padding:1px 8px;border-radius:8px;margin-top:2px;width:fit-content;">관리자</div>
-          <div class="logout-btn" onclick="doLogout()">로그아웃</div>
+          <div style="display:flex;gap:6px;margin-top:3px;">
+            <span style="font-size:11px;color:#1D9E75;cursor:pointer;" onclick="event.stopPropagation();openMyPage()">내 정보</span>
+            <span style="font-size:11px;color:#999;">|</span>
+            <span class="logout-btn" onclick="event.stopPropagation();doLogout()">로그아웃</span>
+          </div>
         </div>
       </div>
     </div>
