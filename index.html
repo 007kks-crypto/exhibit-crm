@@ -11,7 +11,7 @@
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
   import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile }
     from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
-  import { getFirestore, collection, doc, addDoc, updateDoc, deleteDoc, onSnapshot, query, where, serverTimestamp, orderBy }
+  import { getFirestore, collection, doc, addDoc, updateDoc, deleteDoc, setDoc, getDoc, onSnapshot, query, where, serverTimestamp, orderBy }
     from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 
   const firebaseConfig = {
@@ -109,9 +109,9 @@
     try {
       const cred = await createUserWithEmailAndPassword(auth,email,pw);
       await updateProfile(cred.user,{displayName:name});
-      // users 컬렉션에 저장
+      // uid를 문서 ID로 저장 (중복 방지)
       try {
-        await addDoc(collection(db,'users'),{
+        await setDoc(doc(db,'users',cred.user.uid),{
           uid:cred.user.uid, name, email,
           joinedAt:serverTimestamp(), lastLogin:serverTimestamp()
         });
@@ -289,19 +289,22 @@
       }
     });
 
-    // 회원가입 시 users 컬렉션에 저장 (이미 있으면 업데이트)
-    updateDoc(doc(db,'users',currentUser.uid), {
-      name: currentUser.displayName||'',
-      email: currentUser.email||'',
-      lastLogin: serverTimestamp()
-    }).catch(()=>{
-      addDoc(collection(db,'users'), {
-        uid: currentUser.uid,
-        name: currentUser.displayName||'',
-        email: currentUser.email||'',
-        joinedAt: serverTimestamp(),
-        lastLogin: serverTimestamp()
-      });
+    // uid를 문서 ID로 사용 → 중복 없이 저장
+    const userRef = doc(db, 'users', currentUser.uid);
+    getDoc(userRef).then(snap => {
+      if (snap.exists()) {
+        // 이미 있으면 lastLogin만 업데이트
+        updateDoc(userRef, { lastLogin: serverTimestamp() });
+      } else {
+        // 처음 로그인이면 신규 저장
+        setDoc(userRef, {
+          uid:      currentUser.uid,
+          name:     currentUser.displayName||'',
+          email:    currentUser.email||'',
+          joinedAt: serverTimestamp(),
+          lastLogin:serverTimestamp()
+        });
+      }
     });
 
     unsubProjects = onSnapshot(collection(db,'projects'), snap => {
@@ -750,6 +753,108 @@
       </div>`}`;
   }
 
+  // ── Dashboard ─────────────────────────────
+  async function renderDashboard() {
+    $('topbarTitle').textContent = '대시보드';
+    $('topbarMeta').textContent  = '전시회별 영업 활동 현황';
+    $('detailPanel').style.display = 'none';
+
+    // 전체 고객 데이터 가져오기
+    const custSnap = await new Promise(res => { const u = onSnapshot(collection(db,'customers'), s=>{u();res(s);}); });
+    const allCustomers = custSnap.docs.map(d=>({id:d.id,...d.data()}));
+
+    // 전시회별 분석
+    const projectCards = projects.map(p => {
+      const pCusts = allCustomers.filter(c => c.projectId === p.id);
+      const totalCustomers = pCusts.length;
+      const totalMemos = pCusts.reduce((sum,c)=>(c.memos||[]).length+sum, 0);
+      const withCard = pCusts.filter(c=>c.cardImage).length;
+
+      // 담당자별 미팅록(메모) 집계
+      const memoByAuthor = {};
+      const custByAuthor = {};
+      pCusts.forEach(c => {
+        const author = c.authorName || c.createdBy || '알 수 없음';
+        custByAuthor[author] = (custByAuthor[author]||0) + 1;
+        const memoCount = (c.memos||[]).length;
+        memoByAuthor[author] = (memoByAuthor[author]||0) + memoCount;
+      });
+
+      // 미팅록 순위 정렬
+      const memoRanking = Object.entries(memoByAuthor)
+        .sort((a,b) => b[1]-a[1])
+        .slice(0,5); // top 5
+
+      const maxMemo = memoRanking.length ? memoRanking[0][1] : 1;
+
+      const dr = p.dateFrom?(p.dateTo&&p.dateTo!==p.dateFrom?`${p.dateFrom} ~ ${p.dateTo}`:p.dateFrom):(p.date||'');
+
+      const rankingHtml = memoRanking.length === 0
+        ? '<div style="font-size:12px;color:#999;padding:8px 0;">미팅록이 없습니다.</div>'
+        : memoRanking.map(([author, count], i) => {
+            const cl = col(author);
+            const pct = Math.round((count/maxMemo)*100);
+            const medals = ['🥇','🥈','🥉'];
+            const custCount = custByAuthor[author]||0;
+            return `<div style="margin-bottom:12px;">
+              <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:5px;">
+                <div style="display:flex;align-items:center;gap:8px;">
+                  <span style="font-size:14px;">${medals[i]||'  '}</span>
+                  <div style="width:24px;height:24px;border-radius:50%;background:${cl.bg};color:${cl.txt};display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:600;">${ini(author)}</div>
+                  <span style="font-size:13px;font-weight:${i===0?'600':'400'};">${author}</span>
+                </div>
+                <div style="text-align:right;">
+                  <span style="font-size:13px;font-weight:600;color:#1D9E75;">${count}건</span>
+                  <span style="font-size:11px;color:#999;margin-left:4px;">(고객 ${custCount}명)</span>
+                </div>
+              </div>
+              <div style="height:6px;background:#F4F3EF;border-radius:3px;overflow:hidden;">
+                <div style="height:100%;width:${pct}%;background:${i===0?'#1D9E75':i===1?'#185FA5':'#854F0B'};border-radius:3px;transition:width 0.4s;"></div>
+              </div>
+            </div>`;
+          }).join('');
+
+      return `<div style="background:#fff;border:1px solid rgba(0,0,0,0.08);border-radius:14px;padding:20px;margin-bottom:16px;">
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:16px;">
+          <div>
+            <div style="font-weight:600;font-size:15px;">${p.name}</div>
+            <div style="font-size:12px;color:#999;margin-top:2px;">${p.location||''}${dr?' · '+dr:''}</div>
+          </div>
+          <div style="display:flex;gap:8px;flex-shrink:0;">
+            <div style="text-align:center;padding:8px 12px;background:#F4F3EF;border-radius:10px;">
+              <div style="font-size:18px;font-weight:600;">${totalCustomers}</div>
+              <div style="font-size:10px;color:#999;">고객</div>
+            </div>
+            <div style="text-align:center;padding:8px 12px;background:#E1F5EE;border-radius:10px;">
+              <div style="font-size:18px;font-weight:600;color:#1D9E75;">${totalMemos}</div>
+              <div style="font-size:10px;color:#0F6E56;">미팅록</div>
+            </div>
+            <div style="text-align:center;padding:8px 12px;background:#E6F1FB;border-radius:10px;">
+              <div style="font-size:18px;font-weight:600;color:#185FA5;">${withCard}</div>
+              <div style="font-size:10px;color:#185FA5;">명함</div>
+            </div>
+          </div>
+        </div>
+        <div style="border-top:1px solid rgba(0,0,0,0.06);padding-top:14px;">
+          <div style="font-size:11px;font-weight:600;color:#999;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:12px;">미팅록 순위</div>
+          ${rankingHtml}
+        </div>
+        <div style="margin-top:12px;text-align:right;">
+          <button class="btn" style="font-size:12px;padding:5px 10px;" onclick="selectProject('${p.id}')">고객 보기 →</button>
+        </div>
+      </div>`;
+    }).join('');
+
+    $('viewDashboard').innerHTML = `
+      <div class="section-header" style="margin-bottom:16px;">
+        <div class="section-title">전시회별 영업 현황 (${projects.length}개)</div>
+        <button class="btn" style="font-size:12px;padding:5px 10px;" onclick="renderDashboard()">🔄 새로고침</button>
+      </div>
+      ${projects.length === 0
+        ? '<div class="empty-state">등록된 전시회가 없습니다.</div>'
+        : projectCards}`;
+  }
+
   // ── Members Page ──────────────────────────
   window.toggleAdmin = async (uid, email, currentlyAdmin) => {
     if (email === SUPER_ADMIN) { toast('최고 관리자는 변경할 수 없습니다.'); return; }
@@ -849,15 +954,16 @@
   window.setView = v => {
     const exportBtn=$('exportBtn');
     if (exportBtn) exportBtn.style.display=(v==='customers'&&activeProject)?'inline-flex':'none';
-    ['viewCustomers','viewProjects','viewCards','viewPrice','viewNotices','viewMembers'].forEach(id=>$(id).style.display='none');
+    ['viewCustomers','viewProjects','viewCards','viewPrice','viewNotices','viewMembers','viewDashboard'].forEach(id=>$(id).style.display='none');
     $('view'+v.charAt(0).toUpperCase()+v.slice(1)).style.display='block';
-    ['nav0','nav1','nav2','nav3','nav4','nav5'].forEach((id,i)=>$(id)&&$(id).classList.toggle('active',
-      (v==='customers'&&i===0)||(v==='projects'&&i===1)||(v==='cards'&&i===2)||(v==='price'&&i===3)||(v==='notices'&&i===4)||(v==='members'&&i===5)));
-    if (v==='projects')  renderProjectsPage();
-    else if (v==='cards')    renderCardsPage();
-    else if (v==='price')    renderPriceListPage();
-    else if (v==='notices')  renderNoticesPage();
-    else if (v==='members')  renderMembersPage();
+    ['nav0','nav1','nav2','nav3','nav4','nav5','nav6'].forEach((id,i)=>$(id)&&$(id).classList.toggle('active',
+      (v==='customers'&&i===0)||(v==='projects'&&i===1)||(v==='cards'&&i===2)||(v==='price'&&i===3)||(v==='notices'&&i===4)||(v==='members'&&i===5)||(v==='dashboard'&&i===6)));
+    if (v==='projects')   renderProjectsPage();
+    else if (v==='cards')      renderCardsPage();
+    else if (v==='price')      renderPriceListPage();
+    else if (v==='notices')    renderNoticesPage();
+    else if (v==='members')    renderMembersPage();
+    else if (v==='dashboard')  renderDashboard();
     else { renderStats(); renderTable(); }
   };
 
@@ -1136,6 +1242,7 @@ textarea{resize:vertical;min-height:80px;line-height:1.5;}
     </div>
     <div class="sidebar-section">
       <div class="sidebar-label">메뉴</div>
+      <div class="nav-item" id="nav6" onclick="setView('dashboard')"><span style="font-size:14px;">📊</span>대시보드</div>
       <div class="nav-item active" id="nav0" onclick="setView('customers')"><span style="font-size:14px;">👥</span>고객 목록</div>
       <div class="nav-item" id="nav1" onclick="setView('projects')"><span style="font-size:14px;">📋</span>전시회 관리</div>
       <div class="nav-item" id="nav2" style="display:none;" onclick="setView('cards')"><span style="font-size:14px;">📇</span>명함 갤러리</div>
@@ -1193,7 +1300,8 @@ textarea{resize:vertical;min-height:80px;line-height:1.5;}
       <div id="viewCards"    style="display:none;"></div>
       <div id="viewPrice"    style="display:none;"></div>
       <div id="viewNotices"  style="display:none;"></div>
-      <div id="viewMembers"  style="display:none;"></div>
+      <div id="viewMembers"    style="display:none;"></div>
+      <div id="viewDashboard" style="display:none;"></div>
     </div>
   </div>
   <div id="detailPanel" style="display:none;"></div>
