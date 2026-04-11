@@ -6,12 +6,13 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
 <title>ExhibitCRM</title>
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=Pretendard:wght@400;500;600&display=swap" rel="stylesheet">
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
   import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile }
     from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
-  import { getFirestore, collection, doc, addDoc, updateDoc, deleteDoc, setDoc, getDoc, onSnapshot, query, where, serverTimestamp, orderBy }
+  import { getFirestore, collection, doc, addDoc, updateDoc, deleteDoc, setDoc, getDoc, getDocs, onSnapshot, query, where, serverTimestamp, orderBy }
     from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 
   const firebaseConfig = {
@@ -45,10 +46,15 @@
   let selectedCust   = null;
   let unsubCustomers = null;
   let unsubProjects  = null;
+  let unsubAllCustomers = null;
+  let allCustomers   = []; // 전체 고객 (전시회 무관)
   let unsubNotices   = null;
   let sidebarOpen    = false;
   let cameraStream   = null;
   let cardImageData  = null;
+  let qrScanMode     = false;  // QR 스캔 모드
+  let qrScanLoop     = null;   // QR 스캔 루프 ID
+  let qrScanned      = false;  // 중복 스캔 방지
 
   const col     = s => { let h=0; for(let c of s) h=(h*31+c.charCodeAt(0))%COLORS.length; return COLORS[h]; };
   const ini     = n => n ? n.slice(0,2) : '?';
@@ -65,6 +71,21 @@
              d.toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'});
     } catch(e) { return '—'; }
   };
+  const purposeColor = p => {
+    const map = {
+      '일반적 정보탐색': {bg:'#E6F1FB', txt:'#185FA5'},
+      '구체적인 정보수집': {bg:'#FAEEDA', txt:'#854F0B'},
+      '구매 일정 확립':   {bg:'#E1F5EE', txt:'#0F6E56'},
+      '기타':             {bg:'#F4F3EF', txt:'#999'},
+    };
+    return map[p] || {bg:'#F4F3EF', txt:'#999'};
+  };
+  const purposeBadge = p => {
+    if (!p) return '';
+    const c = purposeColor(p);
+    return `<span style="font-size:10px;padding:2px 7px;border-radius:8px;background:${c.bg};color:${c.txt};font-weight:600;white-space:nowrap;">${p}</span>`;
+  };
+
   const fmtPrice = v => {
     if (!v && v!==0) return '—';
     return Number(v).toLocaleString('ko-KR') + '원';
@@ -81,7 +102,7 @@
       $('adminBadge').style.display  = isAdmin() ? 'inline-block' : 'none';
       $('nav2').style.display        = isAdmin() ? 'flex' : 'none';
       $('nav5').style.display        = isAdmin() ? 'flex' : 'none';
-      startApp();
+      startApp(true); // true = 로그인 직후
     } else {
       $('authScreen').style.display = 'flex';
       $('appScreen').style.display  = 'none';
@@ -90,9 +111,10 @@
   });
 
   function cleanup() {
-    if (unsubProjects)  { unsubProjects();  unsubProjects  = null; }
-    if (unsubCustomers) { unsubCustomers(); unsubCustomers = null; }
-    if (unsubNotices)   { unsubNotices();   unsubNotices   = null; }
+    if (unsubProjects)     { unsubProjects();     unsubProjects     = null; }
+    if (unsubCustomers)    { unsubCustomers();    unsubCustomers    = null; }
+    if (unsubAllCustomers) { unsubAllCustomers(); unsubAllCustomers = null; }
+    if (unsubNotices)      { unsubNotices();      unsubNotices      = null; }
     projects=[]; customers=[]; notices=[]; priceLists={}; activeProject=null; selectedCust=null;
   }
 
@@ -139,7 +161,7 @@
       const dr = p.dateFrom?(p.dateTo&&p.dateTo!==p.dateFrom?`${p.dateFrom}~${p.dateTo}`:p.dateFrom):(p.date||'');
 
       // 헤더
-      const headers = ['번호','고객명','소속','지역','상담일','등록일시','담당자','명함여부','메모수','상담내용(최신순)'];
+      const headers = ['번호','고객명','소속','지역','방문목적','상담일','등록일시','담당자','명함여부','메모수','상담내용'];
 
       // 데이터 행
       const rows = all.map((c, i) => {
@@ -151,6 +173,7 @@
           c.name||'',
           c.org||'',
           c.region||'',
+          c.purpose||'',
           c.date||'',
           dtStr,
           c.authorName||'',
@@ -175,7 +198,7 @@
 
       // 열 너비 설정
       ws['!cols'] = [
-        {wch:5},{wch:12},{wch:18},{wch:8},{wch:12},
+        {wch:5},{wch:12},{wch:18},{wch:8},{wch:14},{wch:12},
         {wch:18},{wch:14},{wch:8},{wch:6},{wch:50}
       ];
 
@@ -216,13 +239,81 @@
   };
 
   // ── Camera ────────────────────────────────
-  window.openCamera = async () => {
+  window.openCamera = async (mode='photo') => {
+    qrScanMode = (mode === 'qr');
+    qrScanned  = false;
     $('cameraWrap').style.display='flex';
+    // UI 전환
+    $('camShootBtn').style.display  = qrScanMode ? 'none'  : 'flex';
+    $('camQrGuide').style.display   = qrScanMode ? 'flex'  : 'none';
+    $('camPhotoGuide').style.display= qrScanMode ? 'none'  : 'flex';
+    $('camQrResult').style.display  = 'none';
+    $('camQrResult').textContent    = '';
     try {
       cameraStream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'},audio:false});
-      $('cameraVideo').srcObject=cameraStream; await $('cameraVideo').play();
+      $('cameraVideo').srcObject = cameraStream;
+      await $('cameraVideo').play();
+      if (qrScanMode) startQrScan();
     } catch(e) { $('cameraWrap').style.display='none'; toast('카메라를 사용할 수 없습니다. 갤러리에서 선택해주세요.'); }
   };
+
+  // QR 실시간 스캔
+  function startQrScan() {
+    const canvas  = $('cameraCanvas');
+    const video   = $('cameraVideo');
+    const ctx     = canvas.getContext('2d');
+    function scan() {
+      if (!qrScanMode || qrScanned) return;
+      if (video.readyState === video.HAVE_ENOUGH_DATA) {
+        canvas.width  = video.videoWidth;
+        canvas.height = video.videoHeight;
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const code = jsQR(imageData.data, imageData.width, imageData.height, {inversionAttempts:'dontInvert'});
+        if (code && code.data) {
+          qrScanned = true;
+          onQrDetected(code.data);
+          return;
+        }
+      }
+      qrScanLoop = requestAnimationFrame(scan);
+    }
+    qrScanLoop = requestAnimationFrame(scan);
+  }
+
+  function onQrDetected(text) {
+    // 스캔 성공 — 결과 표시
+    const resultEl = $('camQrResult');
+    resultEl.style.display = 'block';
+    resultEl.textContent   = '✅ 스캔 완료: ' + text.slice(0, 80) + (text.length>80?'...':'');
+    // 진동 (모바일)
+    if (navigator.vibrate) navigator.vibrate(200);
+    toast('QR 스캔 완료!');
+    // 2초 후 카메라 닫고 메모에 저장
+    setTimeout(() => {
+      closeCamera();
+      applyQrResult(text);
+    }, 1500);
+  }
+
+  function applyQrResult(text) {
+    // 모달이 열려있으면 메모 필드에 삽입
+    const memoEl = $('fc_memo') || $('ec_memo');
+    if (memoEl) {
+      memoEl.value = memoEl.value ? memoEl.value + '\n[QR] ' + text : '[QR] ' + text;
+      toast('QR 내용이 메모에 추가되었습니다.');
+      return;
+    }
+    // 상세 패널이 열려있으면 메모 입력란에 삽입
+    const newMemo = $('newMemoText');
+    if (newMemo) {
+      newMemo.value = newMemo.value ? newMemo.value + '\n[QR] ' + text : '[QR] ' + text;
+      toast('QR 내용이 메모 입력란에 추가되었습니다.');
+      return;
+    }
+    // 아무것도 없으면 클립보드에 복사
+    navigator.clipboard.writeText(text).then(()=>toast('QR 내용이 클립보드에 복사되었습니다.')).catch(()=>toast('QR 결과: '+text));
+  }
   window.capturePhoto = () => {
     const v=$('cameraVideo'), canvas=$('cameraCanvas');
     canvas.width=v.videoWidth||640; canvas.height=v.videoHeight||480;
@@ -235,6 +326,8 @@
     closeCamera(); updateCardPreview(); toast('명함 촬영 완료!');
   };
   window.closeCamera = () => {
+    qrScanMode = false;
+    if (qrScanLoop) { cancelAnimationFrame(qrScanLoop); qrScanLoop=null; }
     if (cameraStream) { cameraStream.getTracks().forEach(t=>t.stop()); cameraStream=null; }
     $('cameraWrap').style.display='none';
   };
@@ -268,15 +361,15 @@
   function cardEmptyHtml() {
     return `<div style="border:1.5px dashed rgba(0,0,0,0.15);border-radius:10px;padding:18px;display:flex;flex-direction:column;align-items:center;gap:10px;background:#fafafa;">
       <div style="font-size:13px;color:#999;">명함 사진 등록 (선택)</div>
-      <div style="display:flex;gap:10px;">
-        <button type="button" class="btn" style="font-size:12px;padding:7px 12px;" onclick="openCamera()">📷 카메라 촬영</button>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:center;">
+        <button type="button" class="btn" style="font-size:12px;padding:7px 12px;" onclick="openCamera('photo')">📷 카메라 촬영</button>
         <button type="button" class="btn" style="font-size:12px;padding:7px 12px;" onclick="openGallery()">🖼 갤러리 선택</button>
       </div>
     </div>`;
   }
 
   // ── App Start ─────────────────────────────
-  function startApp() {
+  function startApp(firstLogin=false) {
     // admins 컬렉션 실시간 구독
     onSnapshot(collection(db,'admins'), snap => {
       adminEmails = new Set([SUPER_ADMIN]);
@@ -307,11 +400,40 @@
       }
     });
 
+    // 전체 고객 실시간 구독 (고객 목록 메뉴용)
+    unsubAllCustomers = onSnapshot(collection(db,'customers'), snap => {
+      let all = snap.docs.map(d=>({id:d.id,...d.data()}));
+      // 관리자: 전체 / 일반: 본인 것만 — 모든 페이지 공통 적용
+      if (!isAdmin()) all = all.filter(c => c.createdBy === currentUser.uid);
+      all.sort((a,b)=>(b.createdAt?.seconds||0)-(a.createdAt?.seconds||0));
+      allCustomers = all;
+      // 사이드바 전시회별 카운트 항상 갱신
+      renderProjectList();
+      // viewCustomers가 보이는 상태면 항상 다시 렌더
+      if ($('viewCustomers') && $('viewCustomers').style.display !== 'none') {
+        if (activeProject) {
+          customers = allCustomers.filter(c => c.projectId === activeProject);
+          renderStats(); renderTable();
+        } else {
+          renderAllCustomers();
+        }
+      }
+    });
+
+    let isFirstLoad = true;
     unsubProjects = onSnapshot(collection(db,'projects'), snap => {
       projects = snap.docs.map(d=>({id:d.id,...d.data()}))
         .sort((a,b)=>(b.createdAt?.seconds||0)-(a.createdAt?.seconds||0));
       renderProjectList();
-      if (!activeProject && projects.length) selectProject(projects[0].id);
+      // 첫 로드 시 대시보드로
+      if (isFirstLoad) {
+        isFirstLoad = false;
+        if (firstLogin) {
+          setView('dashboard');
+        } else if (!activeProject && projects.length) {
+          selectProject(projects[0].id);
+        }
+      }
     });
     // notices 실시간 구독
     unsubNotices = onSnapshot(query(collection(db,'notices'), orderBy('createdAt','desc')), snap => {
@@ -331,22 +453,23 @@
       $('topbarTitle').textContent=p.name;
       $('topbarMeta').textContent=`${p.location||''}${dr?' · '+dr:''}`;
     }
-    setView('customers');
     loadCustomers(pid);
     loadPriceList(pid);
     if (isMobile()) closeSidebar();
     const exportBtn = $('exportBtn');
     if (exportBtn) exportBtn.style.display = 'inline-flex';
+    const fb = $('filterBar');
+    if (fb) fb.style.display = 'none';
+    setView('customers');
   };
 
   function loadCustomers(pid) {
     if (unsubCustomers) { unsubCustomers(); unsubCustomers=null; }
     const q=query(collection(db,'customers'),where('projectId','==',pid));
     unsubCustomers=onSnapshot(q,snap=>{
-      let all=snap.docs.map(d=>({id:d.id,...d.data()}));
-      if (!isAdmin()) all=all.filter(c=>c.createdBy===currentUser.uid);
-      all.sort((a,b)=>(b.createdAt?.seconds||0)-(a.createdAt?.seconds||0));
-      customers=all; renderStats(); renderTable();
+      // allCustomers에서 해당 전시회만 필터 (이미 권한 필터 적용된 데이터)
+      customers = allCustomers.filter(c=>c.projectId===pid);
+      renderStats(); renderTable();
       if (selectedCust) { const s=customers.find(x=>x.id===selectedCust); if(s) renderDetail(selectedCust); else { $('detailPanel').style.display='none'; selectedCust=null; } }
     });
   }
@@ -388,6 +511,7 @@
     try {
       await addDoc(collection(db,'customers'),{
         name,org,region:$('fc_region').value,date:$('fc_date').value||today(),
+        purpose:$('fc_purpose').value||'',
         cardImage:cardImageData||null,
         memos:memo?[{text:memo,date:today(),time:new Date().toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'}),author:currentUser.displayName||currentUser.email}]:[],
         projectId:selPid,createdBy:currentUser.uid,authorName:currentUser.displayName||currentUser.email,createdAt:serverTimestamp()
@@ -565,12 +689,150 @@
 
   // ── Render ────────────────────────────────
   function renderProjectList() {
-    $('projectList').innerHTML=projects.map(p=>`
-      <div class="project-chip${p.id===activeProject?' active':''}" onclick="selectProject('${p.id}')">
+    $('projectList').innerHTML = projects.map(p => {
+      const cnt = allCustomers.filter(c => c.projectId === p.id).length;
+      return `<div class="project-chip${p.id===activeProject?' active':''}" onclick="selectProject('${p.id}')">
         <span class="project-chip-name" title="${p.name}">${p.name}</span>
-        <span class="project-count">${p.id===activeProject?customers.length:'•'}</span>
-      </div>`).join('')||'<div style="font-size:12px;color:#999;padding:6px 8px;">전시회가 없습니다.</div>';
+        <span class="project-count">${cnt}</span>
+      </div>`;
+    }).join('') || '<div style="font-size:12px;color:#999;padding:6px 8px;">전시회가 없습니다.</div>';
   }
+
+  // ── 전체 고객 목록 ────────────────────────
+  let filterProjectId = '';
+  let filterAuthor    = '';
+
+  // 고객 목록 메뉴 클릭 — 전시회 선택 해제 후 전체 고객 표시
+  window.goAllCustomers = () => {
+    activeProject = null;
+    selectedCust  = null;
+    if (unsubCustomers) { unsubCustomers(); unsubCustomers = null; }
+    $('detailPanel').style.display = 'none';
+    $('topbarTitle').textContent = '고객 목록';
+    $('topbarMeta').textContent  = isAdmin() ? '전체 전시회 · 전체 고객' : '내가 등록한 전체 고객';
+    const exportBtn = $('exportBtn');
+    if (exportBtn) exportBtn.style.display = 'none';
+    // 사이드바 전시회 활성화 해제
+    document.querySelectorAll('.project-chip').forEach(el => el.classList.remove('active'));
+    setView('customers');
+    if (isMobile()) closeSidebar();
+  };
+
+  window.resetFilters = () => { filterProjectId=''; filterAuthor=''; renderAllCustomers(); };
+  window.setFilterProject = v => { filterProjectId=v; renderAllCustomers(); };
+  window.setFilterAuthor  = v => { filterAuthor=v;    renderAllCustomers(); };
+
+  function renderAllCustomers() {
+    $('topbarTitle').textContent = '고객 목록';
+    $('topbarMeta').textContent  = isAdmin() ? '전체 전시회 · 전체 고객' : '내가 등록한 전체 고객';
+    $('detailPanel').style.display = 'none';
+    const exportBtn = $('exportBtn');
+    if (exportBtn) exportBtn.style.display = 'none';
+
+    const q = ($('searchInput')||{value:''}).value.toLowerCase();
+    let cs = allCustomers.filter(c => {
+      if (filterProjectId && c.projectId !== filterProjectId) return false;
+      if (filterAuthor    && c.authorName !== filterAuthor)   return false;
+      if (q && !c.name.toLowerCase().includes(q) &&
+               !c.org.toLowerCase().includes(q)  &&
+               !(c.region||'').includes(q)        &&
+               !(c.authorName||'').toLowerCase().includes(q)) return false;
+      return true;
+    });
+
+    const authors = [...new Set(allCustomers.map(c=>c.authorName||'').filter(Boolean))].sort();
+
+    // 통계
+    $('statsRow').innerHTML = `
+      <div class="stat-card"><div class="stat-label">전체 고객</div><div class="stat-value">${allCustomers.length}</div><div class="stat-sub">모든 전시회</div></div>
+      <div class="stat-card"><div class="stat-label">필터 결과</div><div class="stat-value">${cs.length}</div><div class="stat-sub">명</div></div>
+      <div class="stat-card"><div class="stat-label">전시회 수</div><div class="stat-value">${projects.length}</div><div class="stat-sub">개</div></div>
+      <div class="stat-card"><div class="stat-label">명함 등록</div><div class="stat-value">${allCustomers.filter(c=>c.cardImage).length}</div><div class="stat-sub">건</div></div>`;
+
+    $('sectionTitle').textContent = `전체 고객 ${cs.length}명`;
+
+    // 필터 UI
+    const filterBar = $('filterBar');
+    filterBar.style.display = 'flex';
+    filterBar.style.gap = '8px';
+    filterBar.style.flexWrap = 'wrap';
+    filterBar.style.alignItems = 'center';
+    filterBar.innerHTML = `
+      <select onchange="setFilterProject(this.value)" style="font-size:12px;padding:6px 10px;border:1px solid rgba(0,0,0,0.13);border-radius:8px;background:#fff;color:#1A1A1A;cursor:pointer;">
+        <option value="">📋 전시회 전체</option>
+        ${projects.map(p=>`<option value="${p.id}"${filterProjectId===p.id?' selected':''}>${p.name}</option>`).join('')}
+      </select>
+      ${isAdmin()?`<select onchange="setFilterAuthor(this.value)" style="font-size:12px;padding:6px 10px;border:1px solid rgba(0,0,0,0.13);border-radius:8px;background:#fff;color:#1A1A1A;cursor:pointer;">
+        <option value="">👤 담당자 전체</option>
+        ${authors.map(a=>`<option value="${a}"${filterAuthor===a?' selected':''}>${a}</option>`).join('')}
+      </select>`:''}
+      ${(filterProjectId||filterAuthor)?`<button class="btn" style="font-size:12px;padding:5px 10px;color:#E24B4A;border-color:#E24B4A;" onclick="resetFilters()">✕ 초기화</button>`:''}`;
+
+    // 테이블
+    const table = $('customerTable');
+    if (!cs.length) {
+      table.innerHTML = '<div class="empty-state">조건에 맞는 고객이 없습니다.</div>';
+      return;
+    }
+
+    if (isMobile()) {
+      table.innerHTML = cs.map(c => {
+        const cl   = col(c.name);
+        const proj = projects.find(p=>p.id===c.projectId);
+        const isMe = c.createdBy === currentUser?.uid;
+        const avatar = c.cardImage
+          ? `<img src="${c.cardImage}" style="width:36px;height:36px;border-radius:50%;object-fit:cover;flex-shrink:0;">`
+          : `<div class="cust-avatar" style="width:36px;height:36px;font-size:12px;background:${cl.bg};color:${cl.txt};">${ini(c.name)}</div>`;
+        return `<div class="cust-card" onclick="goToCustomer('${c.id}','${c.projectId}')">
+          <div style="display:flex;align-items:center;gap:10px;">${avatar}
+            <div style="flex:1;min-width:0;">
+              <div style="font-weight:600;font-size:14px;">${c.name}</div>
+              <div style="font-size:12px;color:#555;">${c.org}</div>
+            </div>
+            <span class="region-badge">${c.region||''}</span>
+          </div>
+          <div style="margin-top:8px;font-size:11px;color:#999;border-top:1px solid rgba(0,0,0,0.06);padding-top:8px;">
+            <div style="margin-bottom:3px;font-weight:500;">📋 ${proj?proj.name:'—'}</div>
+            <div style="display:flex;gap:10px;flex-wrap:wrap;">
+              <span>👤 ${isMe?'<span style="color:#1D9E75;font-weight:600;">나</span>':c.authorName||'팀원'}</span>
+              <span>🕐 ${fmtDT(c.createdAt)}</span>
+              <span>🗒 메모 ${(c.memos||[]).length}</span>
+              ${c.cardImage?'<span style="color:#1D9E75;">📇</span>':''}
+            </div>
+          </div>
+        </div>`;
+      }).join('');
+    } else {
+      const cols = isAdmin() ? '32px 1.2fr 1fr 1.6fr 1.3fr 0.8fr 0.7fr 60px' : '32px 1.2fr 1fr 1.6fr 1.3fr 0.8fr 0.7fr';
+      table.innerHTML = `
+        <div class="table-head" style="grid-template-columns:${cols};">
+          <div></div><div>고객명</div><div>소속</div><div>전시회</div><div>등록시각</div><div>등록자</div><div>메모/목적</div>${isAdmin()?'<div></div>':''}
+        </div>
+        ${cs.map((c,i) => {
+          const cl   = col(c.name);
+          const proj = projects.find(p=>p.id===c.projectId);
+          const isMe = c.createdBy === currentUser?.uid;
+          const avatar = c.cardImage
+            ? `<img src="${c.cardImage}" style="width:26px;height:26px;border-radius:50%;object-fit:cover;flex-shrink:0;">`
+            : `<div class="cust-avatar" style="background:${cl.bg};color:${cl.txt};">${ini(c.name)}</div>`;
+          return `<div class="table-row" style="grid-template-columns:${cols};${isAdmin()?'':''};" onclick="goToCustomer('${c.id}','${c.projectId}')">
+            <div style="font-size:11px;color:#999;text-align:center;">${i+1}</div>
+            <div class="cust-name-cell">${avatar}<span class="cust-name">${c.name}</span></div>
+            <div class="cust-org">${c.org}</div>
+            <div style="font-size:12px;color:#555;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${proj?proj.name:'—'}</div>
+            <div style="font-size:11px;color:#999;">${fmtDT(c.createdAt)}</div>
+            <div style="font-size:12px;">${isMe?'<span style="color:#1D9E75;font-weight:600;">나</span>':c.authorName||'팀원'}</div>
+            <div style="display:flex;flex-direction:column;gap:3px;">${purposeBadge(c.purpose)}<span class="memo-count">메모 ${(c.memos||[]).length}</span></div>
+            ${isAdmin()?`<div><button class="btn btn-danger" style="font-size:11px;padding:3px 8px;" onclick="event.stopPropagation();deleteCustomer('${c.id}')">삭제</button></div>`:'<div></div>'}
+          </div>`;
+        }).join('')}`;
+    }
+  }
+
+  window.goToCustomer = (cid, pid) => {
+    selectProject(pid);
+    setTimeout(() => selectCustomer(cid), 600);
+  };
 
   function renderStats() {
     const wM=customers.filter(c=>c.memos&&c.memos.length).length;
@@ -605,16 +867,18 @@
             <span>${c.date||'—'}</span><span>${fmtDT(c.createdAt)}</span>
             <span>${isMe?'<span style="color:#1D9E75;font-weight:600;">나</span>':c.authorName||'팀원'}</span>
             ${c.cardImage?'<span style="color:#1D9E75;">📇</span>':''}
+            ${c.purpose?purposeBadge(c.purpose):''}
           </div>
         </div>`;
       }).join('');
     } else {
       $('customerTable').innerHTML=`
-        <div class="table-head"><div></div><div>이름</div><div>소속</div><div>지역</div><div>상담일</div><div>등록시각</div><div>담당자</div><div>명함/메모</div></div>
+        <div class="table-head" style="grid-template-columns:${isAdmin()?'32px 1.4fr 1.4fr 0.8fr 0.9fr 1.2fr 1fr 0.8fr 60px':'32px 1.4fr 1.4fr 0.8fr 0.9fr 1.2fr 1fr 0.8fr'};"><div></div><div>이름</div><div>소속</div><div>지역</div><div>상담일</div><div>등록시각</div><div>담당자</div><div>메모/목적</div>${isAdmin()?'<div></div>':''}</div>
         ${cs.map((c,i)=>{
           const cl=col(c.name); const isMe=c.createdBy===currentUser?.uid;
           const avatar=c.cardImage?`<img src="${c.cardImage}" style="width:26px;height:26px;border-radius:50%;object-fit:cover;flex-shrink:0;">`:`<div class="cust-avatar" style="background:${cl.bg};color:${cl.txt};">${ini(c.name)}</div>`;
-          return `<div class="table-row${selectedCust===c.id?' selected':''}" onclick="selectCustomer('${c.id}')">
+          const rowCols = isAdmin()?'32px 1.4fr 1.4fr 0.8fr 0.9fr 1.2fr 1fr 0.8fr 60px':'32px 1.4fr 1.4fr 0.8fr 0.9fr 1.2fr 1fr 0.8fr';
+          return `<div class="table-row${selectedCust===c.id?' selected':''}" style="grid-template-columns:${rowCols};" onclick="selectCustomer('${c.id}')">
             <div style="font-size:11px;color:#999;text-align:center;">${i+1}</div>
             <div class="cust-name-cell">${avatar}<span class="cust-name">${c.name}</span></div>
             <div class="cust-org">${c.org}</div>
@@ -652,6 +916,7 @@
         ${cardSec}
         <div class="detail-meta-row"><span class="detail-meta-label">지역</span><span class="region-badge">${c.region||''}</span></div>
         <div class="detail-meta-row"><span class="detail-meta-label">상담일</span>${c.date||'—'}</div>
+        <div class="detail-meta-row"><span class="detail-meta-label">방문목적</span>${purposeBadge(c.purpose)||'—'}</div>
         <div class="detail-meta-row"><span class="detail-meta-label">담당자</span>${isMe?'나 ('+(currentUser.displayName||currentUser.email)+')':c.authorName||'팀원'}</div>
         <div class="detail-meta-row"><span class="detail-meta-label">등록시각</span><span style="font-size:12px;">${fmtDT(c.createdAt)}</span></div>
       </div>
@@ -659,6 +924,9 @@
         <div class="memo-section-title">상담 메모 (${(c.memos||[]).length})</div>
         <div id="memoList">${memoHtml}</div>
         <div style="margin-top:12px;">
+          <div style="display:flex;gap:6px;margin-bottom:6px;">
+            <button class="btn" style="font-size:11px;padding:5px 10px;flex:1;justify-content:center;" onclick="openCamera('qr')">📱 코드 스캔</button>
+          </div>
           <textarea id="newMemoText" placeholder="상담 내용을 입력하세요..."></textarea>
           <div style="display:flex;justify-content:flex-end;margin-top:6px;">
             <button class="btn btn-primary" style="font-size:12px;padding:8px 16px;" onclick="addMemo('${c.id}')">메모 저장</button>
@@ -730,7 +998,7 @@
     $('topbarTitle').textContent='명함 갤러리';
     $('topbarMeta').textContent='등록된 명함 사진 모아보기';
     $('detailPanel').style.display='none';
-    const withCards=customers.filter(c=>c.cardImage);
+    const withCards=allCustomers.filter(c=>c.cardImage);
     $('viewCards').innerHTML=`
       <div class="section-header" style="margin-bottom:14px;">
         <div class="section-title">명함 갤러리 (${withCards.length}장)</div>
@@ -759,13 +1027,12 @@
     $('topbarMeta').textContent  = '전시회별 영업 활동 현황';
     $('detailPanel').style.display = 'none';
 
-    // 전체 고객 데이터 가져오기
-    const custSnap = await new Promise(res => { const u = onSnapshot(collection(db,'customers'), s=>{u();res(s);}); });
-    const allCustomers = custSnap.docs.map(d=>({id:d.id,...d.data()}));
+    // allCustomers 전역변수 사용 (이미 권한 필터 적용됨)
+    const dashCustomers = allCustomers;
 
     // 전시회별 분석
     const projectCards = projects.map(p => {
-      const pCusts = allCustomers.filter(c => c.projectId === p.id);
+      const pCusts = dashCustomers.filter(c => c.projectId === p.id);
       const totalCustomers = pCusts.length;
       const totalMemos = pCusts.reduce((sum,c)=>(c.memos||[]).length+sum, 0);
       const withCard = pCusts.filter(c=>c.cardImage).length;
@@ -856,6 +1123,93 @@
   }
 
   // ── Members Page ──────────────────────────
+  // ── 중복 회원 자동 정리 ─────────────────────
+  window.cleanupDuplicateUsers = async () => {
+    if (!isAdmin()) return;
+    const btn = $('cleanupBtn');
+    if (btn) { btn.disabled=true; btn.textContent='정리 중...'; }
+    try {
+      const snap = await getDocs(collection(db,'users'));
+      const all  = snap.docs.map(d=>({docId:d.id, ...d.data()}));
+
+      // uid 기준으로 그룹화
+      const byUid = {};
+      all.forEach(u => {
+        const key = u.uid || u.docId;
+        if (!byUid[key]) byUid[key] = [];
+        byUid[key].push(u);
+      });
+
+      // email 기준으로도 그룹화 (uid 없는 경우 대비)
+      const byEmail = {};
+      all.forEach(u => {
+        if (!u.email) return;
+        if (!byEmail[u.email]) byEmail[u.email] = [];
+        byEmail[u.email].push(u);
+      });
+
+      let deleteCount = 0;
+
+      // uid 기준 중복 제거: 가장 오래된 것(joinedAt 빠른 것) 남기고 나머지 삭제
+      for (const uid of Object.keys(byUid)) {
+        const docs = byUid[uid];
+        if (docs.length <= 1) continue;
+        // joinedAt 기준 정렬 - 가장 오래된 것 유지
+        docs.sort((a,b) => (a.joinedAt?.seconds||0) - (b.joinedAt?.seconds||0));
+        // uid를 docId로 쓰는 문서가 있으면 그걸 우선 유지
+        const keepIdx = docs.findIndex(d => d.docId === uid);
+        const keepDoc = keepIdx>=0 ? docs[keepIdx] : docs[0];
+        for (const d of docs) {
+          if (d.docId === keepDoc.docId) continue;
+          await deleteDoc(doc(db,'users',d.docId));
+          deleteCount++;
+        }
+        // 남긴 문서가 uid를 docId로 쓰지 않는다면 uid docId로 새로 저장 후 기존 삭제
+        if (keepDoc.docId !== uid) {
+          await setDoc(doc(db,'users',uid), {
+            uid: uid,
+            name: keepDoc.name||'',
+            email: keepDoc.email||'',
+            joinedAt: keepDoc.joinedAt||serverTimestamp(),
+            lastLogin: keepDoc.lastLogin||serverTimestamp()
+          });
+          await deleteDoc(doc(db,'users',keepDoc.docId));
+        }
+      }
+
+      // email 기준 추가 중복 제거 (uid 다른데 email 같은 경우)
+      for (const email of Object.keys(byEmail)) {
+        const snap2 = await getDocs(query(collection(db,'users'), where('email','==',email)));
+        const docs2 = snap2.docs.map(d=>({docId:d.id,...d.data()}));
+        if (docs2.length <= 1) continue;
+        docs2.sort((a,b)=>(a.joinedAt?.seconds||0)-(b.joinedAt?.seconds||0));
+        for (let i=1; i<docs2.length; i++) {
+          await deleteDoc(doc(db,'users',docs2[i].docId));
+          deleteCount++;
+        }
+      }
+
+      toast(`✅ 중복 ${deleteCount}건이 정리되었습니다.`);
+      renderMembersPage();
+    } catch(e) {
+      toast('정리 실패: '+e.message);
+      console.error(e);
+    } finally {
+      if (btn) { btn.disabled=false; btn.textContent='🧹 중복 정리'; }
+    }
+  };
+
+  window.deleteUser = async (uid, email) => {
+    if (email === SUPER_ADMIN) { toast('최고 관리자는 삭제할 수 없습니다.'); return; }
+    if (uid === currentUser.uid) { toast('본인 계정은 삭제할 수 없습니다.'); return; }
+    if (!confirm(`${email} 회원을 삭제하시겠습니까?\n(Firebase 인증 계정은 유지되며 목록에서만 제거됩니다.)`)) return;
+    try {
+      await deleteDoc(doc(db, 'users', uid));
+      toast(`${email} 회원이 삭제되었습니다.`);
+      renderMembersPage();
+    } catch(e) { toast('삭제 실패: '+e.message); }
+  };
+
   window.toggleAdmin = async (uid, email, currentlyAdmin) => {
     if (email === SUPER_ADMIN) { toast('최고 관리자는 변경할 수 없습니다.'); return; }
     try {
@@ -893,7 +1247,7 @@
       const dtStr = dt ? dt.toLocaleDateString('ko-KR') + ' ' + dt.toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'}) : '—';
       const lastDt = u.lastLogin?.toDate ? u.lastLogin.toDate() : null;
       const lastStr = lastDt ? lastDt.toLocaleDateString('ko-KR') : '—';
-      return `<div style="display:grid;grid-template-columns:36px 1.5fr 2fr 1fr 1fr 100px;padding:12px 16px;border-bottom:1px solid rgba(0,0,0,0.06);align-items:center;gap:10px;font-size:13px;">
+      return `<div style="display:grid;grid-template-columns:36px 1.5fr 2fr 1fr 1fr 160px;padding:12px 16px;border-bottom:1px solid rgba(0,0,0,0.06);align-items:center;gap:10px;font-size:13px;">
         <div style="width:32px;height:32px;border-radius:50%;background:${cl.bg};color:${cl.txt};display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;">${ini(u.name||u.email)}</div>
         <div>
           <div style="font-weight:600;">${u.name||'—'}</div>
@@ -903,12 +1257,15 @@
         <div style="font-size:11px;color:#999;">${dtStr}</div>
         <div style="font-size:11px;color:#999;">${lastStr}</div>
         <div>
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
           ${isSuperAdmin
             ? '<span style="font-size:11px;padding:3px 10px;border-radius:8px;background:#E1F5EE;color:#0F6E56;font-weight:600;">최고관리자</span>'
             : `<button class="btn${isAdminUser?' btn-danger':' btn-primary'}" style="font-size:11px;padding:5px 10px;" onclick="toggleAdmin('${u.uid}','${u.email}',${isAdminUser})">
                 ${isAdminUser?'관리자 해제':'관리자 지정'}
-              </button>`
+              </button>
+              <button class="btn btn-danger" style="font-size:11px;padding:5px 10px;" onclick="deleteUser('${u.uid}','${u.email}')">삭제</button>`
           }
+        </div>
         </div>
       </div>`;
     }).join('');
@@ -916,9 +1273,10 @@
     $('viewMembers').innerHTML = `
       <div class="section-header" style="margin-bottom:14px;">
         <div class="section-title">회원 목록 (${users.length}명)</div>
+        <button class="btn" id="cleanupBtn" style="font-size:12px;padding:6px 12px;" onclick="cleanupDuplicateUsers()">🧹 중복 정리</button>
       </div>
       <div style="background:#fff;border:1px solid rgba(0,0,0,0.08);border-radius:14px;overflow:hidden;">
-        <div style="display:grid;grid-template-columns:36px 1.5fr 2fr 1fr 1fr 100px;padding:10px 16px;background:#F4F3EF;font-size:10px;font-weight:600;color:#999;text-transform:uppercase;letter-spacing:0.5px;gap:10px;">
+        <div style="display:grid;grid-template-columns:36px 1.5fr 2fr 1fr 1fr 160px;padding:10px 16px;background:#F4F3EF;font-size:10px;font-weight:600;color:#999;text-transform:uppercase;letter-spacing:0.5px;gap:10px;">
           <div></div><div>이름</div><div>이메일</div><div>가입일시</div><div>최근접속</div><div>권한</div>
         </div>
         ${rows||'<div class="empty-state">가입한 회원이 없습니다.</div>'}
@@ -951,21 +1309,60 @@
   }
 
   // ── View switching ────────────────────────
-  window.setView = v => {
+  let _suppressHistory = false;
+
+  window.setView = (v, fromHistory=false) => {
     const exportBtn=$('exportBtn');
     if (exportBtn) exportBtn.style.display=(v==='customers'&&activeProject)?'inline-flex':'none';
     ['viewCustomers','viewProjects','viewCards','viewPrice','viewNotices','viewMembers','viewDashboard'].forEach(id=>$(id).style.display='none');
     $('view'+v.charAt(0).toUpperCase()+v.slice(1)).style.display='block';
     ['nav0','nav1','nav2','nav3','nav4','nav5','nav6'].forEach((id,i)=>$(id)&&$(id).classList.toggle('active',
       (v==='customers'&&i===0)||(v==='projects'&&i===1)||(v==='cards'&&i===2)||(v==='price'&&i===3)||(v==='notices'&&i===4)||(v==='members'&&i===5)||(v==='dashboard'&&i===6)));
+    // 브라우저 히스토리에 상태 추가 (뒤로가기 지원)
+    if (!fromHistory) {
+      const state = { view: v, projectId: activeProject };
+      history.pushState(state, '', '#'+v+(activeProject?'/'+activeProject:''));
+    }
     if (v==='projects')   renderProjectsPage();
     else if (v==='cards')      renderCardsPage();
     else if (v==='price')      renderPriceListPage();
     else if (v==='notices')    renderNoticesPage();
     else if (v==='members')    renderMembersPage();
     else if (v==='dashboard')  renderDashboard();
-    else { renderStats(); renderTable(); }
+    else {
+      if (activeProject) {
+        const fb = $('filterBar');
+        if (fb) fb.style.display = 'none';
+        customers = allCustomers.filter(c => c.projectId === activeProject);
+        renderStats(); renderTable();
+      } else {
+        renderAllCustomers();
+      }
+    }
   };
+
+  // 뒤로가기/앞으로가기 처리
+  window.addEventListener('popstate', e => {
+    if (!currentUser) return;
+    const state = e.state;
+    if (!state) { setView('dashboard', true); return; }
+    if (state.projectId && state.projectId !== activeProject) {
+      activeProject = state.projectId;
+      customers = allCustomers.filter(c => c.projectId === activeProject);
+      loadPriceList(activeProject);
+      const p = projects.find(x=>x.id===activeProject);
+      if (p) {
+        const dr = p.dateFrom?(p.dateTo&&p.dateTo!==p.dateFrom?`${p.dateFrom} ~ ${p.dateTo}`:p.dateFrom):(p.date||'');
+        $('topbarTitle').textContent = p.name;
+        $('topbarMeta').textContent  = `${p.location||''}${dr?' · '+dr:''}`;
+      }
+      renderProjectList();
+    } else if (!state.projectId) {
+      activeProject = null;
+      selectedCust  = null;
+    }
+    setView(state.view, true);
+  });
 
   window.openModal  = html => { $('modal').innerHTML=html; $('modalOverlay').style.display='flex'; };
   window.closeModal = () => { $('modalOverlay').style.display='none'; closeCamera(); cardImageData=null; };
@@ -986,7 +1383,23 @@
         <div><label class="form-label">지역</label><select id="fc_region">${REGIONS.map(r=>`<option>${r}</option>`).join('')}</select></div>
         <div><label class="form-label">상담일</label><input type="date" id="fc_date" value="${today()}"></div>
       </div>
+      <div class="form-row"><label class="form-label">방문 목적 <span class="req">*</span></label>
+        <select id="fc_purpose">
+          <option value="">방문 목적 선택</option>
+          <option value="일반적 정보탐색">일반적 정보탐색</option>
+          <option value="구체적인 정보수집">구체적인 정보수집</option>
+          <option value="구매 일정 확립">구매 일정 확립</option>
+          <option value="기타">기타</option>
+        </select>
+      </div>
       <div class="form-row"><label class="form-label">명함 사진</label><div id="cardPreview">${cardEmptyHtml()}</div></div>
+      <div class="form-row">
+        <label class="form-label">배지 QR/바코드 스캔</label>
+        <button type="button" class="btn" style="font-size:13px;padding:9px 16px;width:100%;justify-content:center;" onclick="openCamera('qr')">
+          📱 코드 촬영 (QR / 바코드)
+        </button>
+        <div style="font-size:11px;color:#999;margin-top:5px;">스캔된 내용은 아래 메모에 자동으로 추가됩니다.</div>
+      </div>
       <div class="form-row"><label class="form-label">첫 상담 메모 (선택)</label><textarea id="fc_memo" placeholder="상담 내용을 입력하세요..."></textarea></div>
       <div class="modal-footer">
         <button class="btn" onclick="closeModal()">취소</button>
@@ -1006,6 +1419,15 @@
       <div class="form-row-2">
         <div><label class="form-label">지역</label><select id="ec_region">${REGIONS.map(r=>`<option${r===c.region?' selected':''}>${r}</option>`).join('')}</select></div>
         <div><label class="form-label">상담일</label><input type="date" id="ec_date" value="${c.date||today()}"></div>
+      </div>
+      <div class="form-row"><label class="form-label">방문 목적 <span class="req">*</span></label>
+        <select id="ec_purpose">
+          <option value="">방문 목적 선택</option>
+          <option value="일반적 정보탐색"${c.purpose==='일반적 정보탐색'?' selected':''}>일반적 정보탐색</option>
+          <option value="구체적인 정보수집"${c.purpose==='구체적인 정보수집'?' selected':''}>구체적인 정보수집</option>
+          <option value="구매 일정 확립"${c.purpose==='구매 일정 확립'?' selected':''}>구매 일정 확립</option>
+          <option value="기타"${c.purpose==='기타'?' selected':''}>기타</option>
+        </select>
       </div>
       <div class="form-row"><label class="form-label">명함 사진</label>
         <div id="cardPreview">${c.cardImage?`<div style="position:relative;display:inline-block;width:100%;"><img src="${c.cardImage}" style="width:100%;max-height:160px;object-fit:cover;border-radius:10px;display:block;"><button onclick="removeCardImage()" style="position:absolute;top:6px;right:6px;background:rgba(0,0,0,0.55);color:#fff;border:none;border-radius:50%;width:26px;height:26px;font-size:14px;cursor:pointer;">✕</button></div>`:cardEmptyHtml()}</div>
@@ -1243,7 +1665,7 @@ textarea{resize:vertical;min-height:80px;line-height:1.5;}
     <div class="sidebar-section">
       <div class="sidebar-label">메뉴</div>
       <div class="nav-item" id="nav6" onclick="setView('dashboard')"><span style="font-size:14px;">📊</span>대시보드</div>
-      <div class="nav-item active" id="nav0" onclick="setView('customers')"><span style="font-size:14px;">👥</span>고객 목록</div>
+      <div class="nav-item active" id="nav0" onclick="goAllCustomers()"><span style="font-size:14px;">👥</span>고객 목록</div>
       <div class="nav-item" id="nav1" onclick="setView('projects')"><span style="font-size:14px;">📋</span>전시회 관리</div>
       <div class="nav-item" id="nav2" style="display:none;" onclick="setView('cards')"><span style="font-size:14px;">📇</span>명함 갤러리</div>
       <div class="nav-item" id="nav3" onclick="setView('price')"><span style="font-size:14px;">💰</span>가격표</div>
@@ -1293,7 +1715,10 @@ textarea{resize:vertical;min-height:80px;line-height:1.5;}
     <div class="content">
       <div id="viewCustomers">
         <div class="stats-row" id="statsRow"></div>
-        <div class="section-header"><div class="section-title" id="sectionTitle">고객 목록</div></div>
+        <div class="section-header">
+          <div class="section-title" id="sectionTitle">고객 목록</div>
+        </div>
+        <div id="filterBar" style="display:none;margin-bottom:12px;"></div>
         <div class="customer-table" id="customerTable"><div class="empty-state">전시회를 선택하면 고객 목록이 표시됩니다.</div></div>
       </div>
       <div id="viewProjects" style="display:none;"></div>
@@ -1308,11 +1733,19 @@ textarea{resize:vertical;min-height:80px;line-height:1.5;}
 </div>
 
 <div id="cameraWrap">
-  <video id="cameraVideo" autoplay playsinline muted></video>
+  <div style="position:relative;width:100%;max-width:480px;">
+    <video id="cameraVideo" autoplay playsinline muted style="width:100%;border-radius:14px;border:2px solid var(--green);background:#000;display:block;"></video>
+    <!-- QR 스캔 가이드 오버레이 -->
+    <div id="camQrGuide" style="display:none;position:absolute;inset:0;pointer-events:none;">
+      <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:200px;height:200px;border:3px solid #1D9E75;border-radius:12px;box-shadow:0 0 0 9999px rgba(0,0,0,0.45);"></div>
+      <div style="position:absolute;bottom:16px;left:0;right:0;text-align:center;color:rgba(255,255,255,0.8);font-size:13px;">QR코드 / 바코드를 네모 안에 맞추세요</div>
+    </div>
+    <div id="camPhotoGuide" style="position:absolute;bottom:10px;left:0;right:0;text-align:center;color:rgba(255,255,255,0.6);font-size:13px;pointer-events:none;">명함에 카메라를 맞추세요</div>
+  </div>
   <canvas id="cameraCanvas" style="display:none;"></canvas>
-  <div style="font-size:13px;color:rgba(255,255,255,0.6);">명함에 카메라를 맞추세요</div>
+  <div id="camQrResult" style="display:none;background:rgba(29,158,117,0.9);color:#fff;padding:10px 18px;border-radius:10px;font-size:13px;max-width:400px;text-align:center;"></div>
   <div style="display:flex;gap:12px;">
-    <button class="cam-btn cam-shoot" onclick="capturePhoto()">📸 촬영</button>
+    <button id="camShootBtn" class="cam-btn cam-shoot" onclick="capturePhoto()">📸 촬영</button>
     <button class="cam-btn cam-cancel" onclick="closeCamera()">취소</button>
   </div>
 </div>
